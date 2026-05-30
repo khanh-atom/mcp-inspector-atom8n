@@ -697,16 +697,56 @@ app.post(
 
         await webAppTransport.start();
 
-        // [PROXY] Parse allowed tools from query params (if set during Install)
+        // [PROXY] Determine allowed tools — check URL param first, then persisted state
         const allowedToolsParam = req.query.allowedTools as string | undefined;
-        const allowedToolsSet = allowedToolsParam
-          ? new Set(allowedToolsParam.split(",").filter(Boolean))
-          : null;
+        let allowedToolsSet: Set<string> | null = null;
 
-        if (allowedToolsSet) {
-          console.log(
-            `[/mcp] Tool filtering active: ${allowedToolsSet.size} tool(s) allowed`,
+        if (allowedToolsParam) {
+          // Explicit allowedTools in URL (set during Install)
+          allowedToolsSet = new Set(
+            allowedToolsParam.split(",").filter(Boolean),
           );
+          console.log(
+            `[/mcp] Tool filtering from URL param: ${allowedToolsSet.size} tool(s) allowed`,
+          );
+        } else {
+          // Fallback: check server-side persisted tool selection
+          const credentialFile = req.query.credentialFile as string | undefined;
+          const credentialKey = req.query.credentialKey as string | undefined;
+          if (credentialFile && credentialKey) {
+            const credentialId = createCredentialIdentity(
+              credentialFile,
+              credentialKey,
+            );
+            console.log(
+              `[/mcp] Checking persisted tool selection for: ${credentialId}`,
+            );
+            try {
+              const persistedTools = await readPersistedProxyToolSelection(
+                undefined,
+                credentialId,
+              );
+              if (Array.isArray(persistedTools) && persistedTools.length > 0) {
+                allowedToolsSet = new Set(persistedTools);
+                console.log(
+                  `[/mcp] Tool filtering from persisted state: ${allowedToolsSet.size} tool(s) allowed: [${persistedTools.join(", ")}]`,
+                );
+              } else {
+                console.log(
+                  `[/mcp] No persisted tool selection found — all tools allowed`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[/mcp] Failed to read persisted tool selection:`,
+                err,
+              );
+            }
+          } else {
+            console.log(
+              `[/mcp] No credentialFile/credentialKey in URL — skipping tool selection lookup`,
+            );
+          }
         }
 
         mcpProxy({

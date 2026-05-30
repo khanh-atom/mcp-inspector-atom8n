@@ -56,9 +56,20 @@ function filterToolsListResponse(
   const filteredTools = result.tools.filter((tool: any) =>
     allowedTools.has(tool.name),
   );
+  const removedTools = result.tools
+    .filter((tool: any) => !allowedTools.has(tool.name))
+    .map((t: any) => t.name);
 
   console.log(
     `[mcpProxy] Filtered tools/list response: ${filteredTools.length}/${originalCount} tools allowed`,
+  );
+  if (removedTools.length > 0) {
+    console.log(
+      `[mcpProxy] Removed ${removedTools.length} tool(s): [${removedTools.join(", ")}]`,
+    );
+  }
+  console.log(
+    `[mcpProxy] Kept ${filteredTools.length} tool(s): [${filteredTools.map((t: any) => t.name).join(", ")}]`,
   );
 
   return {
@@ -117,8 +128,10 @@ export default function mcpProxy({
 
   if (isFiltering) {
     console.log(
-      `[mcpProxy] Tool filtering enabled: ${allowedTools!.size} tool(s) allowed`,
+      `[mcpProxy] Tool filtering enabled: ${allowedTools!.size} tool(s) allowed: [${[...allowedTools!].join(", ")}]`,
     );
+  } else {
+    console.log(`[mcpProxy] No tool filtering — all tools pass through`);
   }
 
   transportToClient.onmessage = (message) => {
