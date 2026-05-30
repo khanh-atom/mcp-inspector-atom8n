@@ -1116,6 +1116,10 @@ function expandTildePath(rawPath: string): string {
   if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
     return path.join(homeDir, rawPath.slice(2));
   }
+  // Resolve relative paths (e.g. ./data) to absolute
+  if (!path.isAbsolute(rawPath)) {
+    return path.resolve(rawPath);
+  }
   return rawPath;
 }
 
@@ -2286,9 +2290,42 @@ app.post(
     }
   },
 );
-// ── Credential Management Endpoints ────────────────────────────────────────
+// ── Credential Management Endpoints (folder-based) ─────────────────────────
 
-// GET /credentials — Read a credentials JSON file from disk
+/** Helper: parse a single credentials JSON file and return entries */
+function parseCredentialFile(
+  fileContent: string,
+  fileName: string,
+): Array<{
+  key: string;
+  serverName: string;
+  serverUrl: string;
+  hasAccessToken: boolean;
+  hasRefreshToken: boolean;
+  expiresAt: number | null;
+  isExpired: boolean;
+  expiresInMs: number | null;
+  scopes: string[];
+  clientId: string;
+  sourceFile: string;
+}> {
+  const parsed = JSON.parse(fileContent);
+  return Object.entries(parsed).map(([key, value]: [string, any]) => ({
+    key,
+    serverName: value.server_name || key.split("|")[0] || "unknown",
+    serverUrl: value.server_url || "",
+    hasAccessToken: !!value.access_token,
+    hasRefreshToken: !!value.refresh_token,
+    expiresAt: value.expires_at || null,
+    isExpired: value.expires_at ? Date.now() > value.expires_at : false,
+    expiresInMs: value.expires_at ? value.expires_at - Date.now() : null,
+    scopes: value.scopes || [],
+    clientId: value.client_id || "",
+    sourceFile: fileName,
+  }));
+}
+
+// GET /credentials — Read all .json files from a credentials folder
 app.get(
   "/credentials",
   originValidationMiddleware,
@@ -2305,59 +2342,97 @@ app.get(
         return;
       }
 
-      const filePath = expandTildePath(rawPath);
-      logger.info(`[credentials:GET] Reading credentials from: ${filePath}`);
+      const folderPath = expandTildePath(rawPath);
+      logger.info(
+        `[credentials:GET] Reading credentials folder: ${folderPath}`,
+      );
 
       try {
-        const fileContent = await fs.readFile(filePath, "utf8");
-        const credentials = JSON.parse(fileContent);
-
-        // Build a summary of credential entries
-        const entries = Object.entries(credentials).map(
-          ([key, value]: [string, any]) => ({
-            key,
-            serverName: value.server_name || key.split("|")[0] || "unknown",
-            serverUrl: value.server_url || "",
-            hasAccessToken: !!value.access_token,
-            hasRefreshToken: !!value.refresh_token,
-            expiresAt: value.expires_at || null,
-            isExpired: value.expires_at ? Date.now() > value.expires_at : false,
-            expiresInMs: value.expires_at
-              ? value.expires_at - Date.now()
-              : null,
-            scopes: value.scopes || [],
-            clientId: value.client_id || "",
-          }),
-        );
-
-        logger.info(
-          `[credentials:GET] Loaded ${entries.length} credential(s) from ${filePath}`,
-        );
-
-        res.json({
-          success: true,
-          path: filePath,
-          credentials,
-          entries,
-          count: entries.length,
-        });
-      } catch (readErr: any) {
-        if (readErr?.code === "ENOENT") {
+        const stat = await fs.stat(folderPath);
+        if (!stat.isDirectory()) {
           logger.warn(
-            `[credentials:GET] Credentials file not found: ${filePath}`,
+            `[credentials:GET] Path is not a directory: ${folderPath}`,
           );
-          res.status(404).json({
-            error: "Not Found",
-            message: `Credentials file not found at ${filePath}`,
+          res.status(400).json({
+            error: "Bad Request",
+            message: `Path is not a directory: ${folderPath}`,
           });
           return;
         }
-        logger.error(`[credentials:GET] Error reading file:`, readErr);
-        res.status(500).json({
-          error: "Internal Server Error",
-          message: readErr?.message || String(readErr),
-        });
+      } catch (statErr: any) {
+        if (statErr?.code === "ENOENT") {
+          // Auto-create the folder if it doesn't exist
+          logger.info(
+            `[credentials:GET] Folder not found, creating: ${folderPath}`,
+          );
+          await fs.mkdir(folderPath, { recursive: true });
+        } else {
+          throw statErr;
+        }
       }
+
+      // Read all .json files in the folder
+      const dirEntries = await fs.readdir(folderPath);
+      const jsonFiles = dirEntries.filter(
+        (f) => f.endsWith(".json") && !f.startsWith("."),
+      );
+
+      logger.info(
+        `[credentials:GET] Found ${jsonFiles.length} JSON file(s) in folder`,
+      );
+
+      const allEntries: any[] = [];
+      const allCredentials: Record<string, any> = {};
+      const files: Array<{
+        name: string;
+        entryCount: number;
+        error?: string;
+      }> = [];
+
+      for (const fileName of jsonFiles) {
+        const filePath = path.join(folderPath, fileName);
+        try {
+          const content = await fs.readFile(filePath, "utf8");
+          const parsed = JSON.parse(content);
+          const entries = parseCredentialFile(content, fileName);
+          allEntries.push(...entries);
+
+          // Merge into combined credentials with source file tag
+          for (const [key, value] of Object.entries(parsed)) {
+            allCredentials[key] = {
+              ...(value as any),
+              _sourceFile: fileName,
+            };
+          }
+
+          files.push({ name: fileName, entryCount: entries.length });
+          logger.info(
+            `[credentials:GET]   ${fileName}: ${entries.length} entry(ies)`,
+          );
+        } catch (fileErr: any) {
+          logger.warn(
+            `[credentials:GET]   ${fileName}: failed to parse — ${fileErr?.message}`,
+          );
+          files.push({
+            name: fileName,
+            entryCount: 0,
+            error: fileErr?.message,
+          });
+        }
+      }
+
+      logger.info(
+        `[credentials:GET] Total: ${allEntries.length} credential(s) from ${files.length} file(s)`,
+      );
+
+      res.json({
+        success: true,
+        path: folderPath,
+        credentials: allCredentials,
+        entries: allEntries,
+        files,
+        count: allEntries.length,
+      });
     } catch (error: any) {
       logger.error(`[credentials:GET] Unhandled error:`, error);
       res.status(500).json({
@@ -2368,7 +2443,7 @@ app.get(
   },
 );
 
-// PUT /credentials — Write updated credentials back to disk
+// PUT /credentials — Write updated credentials to a specific file in the folder
 app.put(
   "/credentials",
   originValidationMiddleware,
@@ -2376,19 +2451,21 @@ app.put(
   express.json(),
   async (req, res) => {
     try {
-      const { path: rawPath, credentials } = req.body;
-      if (!rawPath || !credentials) {
+      const { folderPath: rawFolder, fileName, credentials } = req.body;
+      if (!rawFolder || !fileName || !credentials) {
         logger.warn(
-          "[credentials:PUT] Missing 'path' or 'credentials' in body",
+          "[credentials:PUT] Missing 'folderPath', 'fileName', or 'credentials'",
         );
         res.status(400).json({
           error: "Bad Request",
-          message: "Both 'path' and 'credentials' are required",
+          message:
+            "'folderPath', 'fileName', and 'credentials' are all required",
         });
         return;
       }
 
-      const filePath = expandTildePath(rawPath);
+      const folder = expandTildePath(rawFolder);
+      const filePath = path.join(folder, fileName);
       logger.info(`[credentials:PUT] Writing credentials to: ${filePath}`);
 
       await fs.writeFile(
@@ -2415,7 +2492,7 @@ app.put(
   },
 );
 
-// POST /credentials/refresh — Refresh an expired OAuth token
+// POST /credentials/refresh — Refresh an expired OAuth token (folder-aware)
 app.post(
   "/credentials/refresh",
   originValidationMiddleware,
@@ -2423,24 +2500,26 @@ app.post(
   express.json(),
   async (req, res) => {
     try {
-      const { path: rawPath, credentialKey } = req.body;
-      if (!rawPath || !credentialKey) {
+      const { folderPath: rawFolder, sourceFile, credentialKey } = req.body;
+      if (!rawFolder || !sourceFile || !credentialKey) {
         logger.warn(
-          "[credentials:refresh] Missing 'path' or 'credentialKey' in body",
+          "[credentials:refresh] Missing 'folderPath', 'sourceFile', or 'credentialKey'",
         );
         res.status(400).json({
           error: "Bad Request",
-          message: "Both 'path' and 'credentialKey' are required",
+          message:
+            "'folderPath', 'sourceFile', and 'credentialKey' are all required",
         });
         return;
       }
 
-      const filePath = expandTildePath(rawPath);
+      const folder = expandTildePath(rawFolder);
+      const filePath = path.join(folder, sourceFile);
       logger.info(
         `[credentials:refresh] Refreshing token for key '${credentialKey}' in ${filePath}`,
       );
 
-      // Read current credentials
+      // Read current credentials from the specific file
       let credentials: Record<string, any>;
       try {
         const fileContent = await fs.readFile(filePath, "utf8");
@@ -2460,11 +2539,11 @@ app.post(
       const cred = credentials[credentialKey];
       if (!cred) {
         logger.warn(
-          `[credentials:refresh] Credential key '${credentialKey}' not found in file`,
+          `[credentials:refresh] Credential key '${credentialKey}' not found in ${sourceFile}`,
         );
         res.status(404).json({
           error: "Not Found",
-          message: `Credential key '${credentialKey}' not found`,
+          message: `Credential key '${credentialKey}' not found in ${sourceFile}`,
         });
         return;
       }
@@ -2480,7 +2559,7 @@ app.post(
         return;
       }
 
-      // Derive token endpoint from server URL (e.g., mcp.us3.datadoghq.com → api.us3.datadoghq.com)
+      // Derive token endpoint from server URL
       const serverUrl = new URL(cred.server_url);
       const apiHost = serverUrl.hostname.replace(/^mcp\./, "api.");
       const tokenUrl = `https://${apiHost}/oauth2/v1/token`;
@@ -2521,7 +2600,7 @@ app.post(
       cred.expires_at = Date.now() + (data.expires_in ?? 3600) * 1000;
       credentials[credentialKey] = cred;
 
-      // Write back to disk
+      // Write back to the specific file
       await fs.writeFile(
         filePath,
         JSON.stringify(credentials, null, 4),
@@ -2529,13 +2608,14 @@ app.post(
       );
 
       logger.info(
-        `[credentials:refresh] Token refreshed & saved for '${credentialKey}'. New expiry: ${new Date(cred.expires_at).toISOString()}`,
+        `[credentials:refresh] Token refreshed & saved for '${credentialKey}' in ${sourceFile}. New expiry: ${new Date(cred.expires_at).toISOString()}`,
       );
 
       res.json({
         success: true,
         message: "Token refreshed successfully",
         credentialKey,
+        sourceFile,
         expiresAt: cred.expires_at,
         expiresInMs: cred.expires_at - Date.now(),
       });
@@ -2549,9 +2629,9 @@ app.post(
   },
 );
 
-// POST /credentials/choose-file — Open native file picker for credentials files
+// POST /credentials/choose-folder — Open native folder picker
 app.post(
-  "/credentials/choose-file",
+  "/credentials/choose-folder",
   originValidationMiddleware,
   authMiddleware,
   (req, res) => {
@@ -2560,23 +2640,25 @@ app.post(
       let command: string;
 
       if (platform === "darwin") {
-        command = `osascript -e 'POSIX path of (choose file of type {"public.json"} with prompt "Select credentials file")'`;
+        command = `osascript -e 'POSIX path of (choose folder with prompt "Select credentials folder")'`;
       } else if (platform === "win32") {
-        command = `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'JSON files (*.json)|*.json'; $f.Title = 'Select credentials file'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }"`;
+        command = `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select credentials folder'; if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath }"`;
       } else {
-        command = `zenity --file-selection --title="Select credentials file" --file-filter="JSON files | *.json"`;
+        command = `zenity --file-selection --directory --title="Select credentials folder"`;
       }
 
-      logger.info(`[credentials:choose-file] Opening file picker`);
+      logger.info(`[credentials:choose-folder] Opening folder picker`);
 
       exec(command, (error: any, stdout: string, stderr: string) => {
         if (error) {
           if (error.code === 1 || stderr.includes("User canceled")) {
-            logger.info(`[credentials:choose-file] User cancelled file picker`);
+            logger.info(
+              `[credentials:choose-folder] User cancelled folder picker`,
+            );
             res.json({ cancelled: true });
             return;
           }
-          logger.error(`[credentials:choose-file] Error: ${error.message}`);
+          logger.error(`[credentials:choose-folder] Error: ${error.message}`);
           res.status(500).json({
             error: "Internal Server Error",
             message: error.message,
@@ -2584,27 +2666,31 @@ app.post(
           return;
         }
 
-        const filePath = stdout.trim();
-        if (!filePath) {
-          logger.info(`[credentials:choose-file] No file selected`);
+        let folderPath = stdout.trim();
+        // macOS osascript appends trailing slash, normalize
+        if (folderPath.endsWith("/")) {
+          folderPath = folderPath.slice(0, -1);
+        }
+        if (!folderPath) {
+          logger.info(`[credentials:choose-folder] No folder selected`);
           res.json({ cancelled: true });
           return;
         }
 
         // Convert absolute path to tilde path for consistency
         const homeDir = os.homedir();
-        const tildePath = filePath.startsWith(homeDir)
-          ? "~/" + filePath.slice(homeDir.length + 1).replace(/\\/g, "/")
-          : filePath;
+        const tildePath = folderPath.startsWith(homeDir)
+          ? "~/" + folderPath.slice(homeDir.length + 1).replace(/\\/g, "/")
+          : folderPath;
 
         logger.info(
-          `[credentials:choose-file] File chosen: ${filePath} (tilde: ${tildePath})`,
+          `[credentials:choose-folder] Folder chosen: ${folderPath} (tilde: ${tildePath})`,
         );
-        res.json({ path: tildePath, absolutePath: filePath });
+        res.json({ path: tildePath, absolutePath: folderPath });
       });
     } catch (error: any) {
       logger.error(
-        `[credentials:choose-file] Error: ${error?.message || String(error)}`,
+        `[credentials:choose-folder] Error: ${error?.message || String(error)}`,
       );
       res.status(500).json({
         error: "Internal Server Error",
@@ -2614,7 +2700,7 @@ app.post(
   },
 );
 
-// POST /credentials/upload — Handle drag-and-drop file content upload
+// POST /credentials/upload — Handle drag-and-drop file into the credentials folder
 app.post(
   "/credentials/upload",
   originValidationMiddleware,
@@ -2622,7 +2708,7 @@ app.post(
   express.json({ limit: "5mb" }),
   async (req, res) => {
     try {
-      const { content, fileName, savePath } = req.body;
+      const { content, fileName, folderPath: rawFolder } = req.body;
       if (!content) {
         logger.warn("[credentials:upload] Missing 'content' in body");
         res.status(400).json({
@@ -2645,15 +2731,19 @@ app.post(
         return;
       }
 
-      // Determine save path: use provided path, or default to ~/.credentials.json
-      const defaultPath = path.join(
-        os.homedir(),
-        fileName || ".credentials.json",
-      );
-      const targetPath = savePath ? expandTildePath(savePath) : defaultPath;
+      // Determine target folder: use provided folder, or default to ./data/
+      const defaultFolder = path.resolve("./data");
+      const targetFolder = rawFolder
+        ? expandTildePath(rawFolder)
+        : defaultFolder;
+      const targetFile = fileName || "credentials.json";
+      const targetPath = path.join(targetFolder, targetFile);
+
+      // Ensure folder exists
+      await fs.mkdir(targetFolder, { recursive: true });
 
       logger.info(
-        `[credentials:upload] Saving dropped file to: ${targetPath} (fileName: ${fileName || "<none>"})`,
+        `[credentials:upload] Saving dropped file to: ${targetPath} (fileName: ${targetFile})`,
       );
 
       // Write the file
@@ -2661,34 +2751,22 @@ app.post(
 
       // Convert to tilde path for UI display
       const homeDir = os.homedir();
-      const tildePath = targetPath.startsWith(homeDir)
-        ? "~/" + targetPath.slice(homeDir.length + 1).replace(/\\/g, "/")
-        : targetPath;
+      const tildeFolderPath = targetFolder.startsWith(homeDir)
+        ? "~/" + targetFolder.slice(homeDir.length + 1).replace(/\\/g, "/")
+        : targetFolder;
 
-      // Build entries summary (same logic as GET /credentials)
-      const entries = Object.entries(parsed).map(
-        ([key, value]: [string, any]) => ({
-          key,
-          serverName: value.server_name || key.split("|")[0] || "unknown",
-          serverUrl: value.server_url || "",
-          hasAccessToken: !!value.access_token,
-          hasRefreshToken: !!value.refresh_token,
-          expiresAt: value.expires_at || null,
-          isExpired: value.expires_at ? Date.now() > value.expires_at : false,
-          expiresInMs: value.expires_at ? value.expires_at - Date.now() : null,
-          scopes: value.scopes || [],
-          clientId: value.client_id || "",
-        }),
-      );
+      // Build entries summary
+      const entries = parseCredentialFile(JSON.stringify(parsed), targetFile);
 
       logger.info(
-        `[credentials:upload] Saved ${entries.length} credential(s) to ${tildePath}`,
+        `[credentials:upload] Saved ${entries.length} credential(s) to ${tildeFolderPath}/${targetFile}`,
       );
 
       res.json({
         success: true,
-        path: tildePath,
-        absolutePath: targetPath,
+        folderPath: tildeFolderPath,
+        absoluteFolderPath: targetFolder,
+        fileName: targetFile,
         credentials: parsed,
         entries,
         count: entries.length,
@@ -2702,7 +2780,6 @@ app.post(
     }
   },
 );
-
 const PORT = parseInt(
   process.env.SERVER_PORT || DEFAULT_MCP_PROXY_LISTEN_PORT,
   10,

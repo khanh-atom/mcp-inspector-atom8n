@@ -19,10 +19,11 @@ import {
   AlertTriangle,
   XCircle,
   Clock,
-  FileText,
+  FolderOpen,
   Server,
   Key,
   Globe,
+  FileText,
 } from "lucide-react";
 import { useToast } from "../lib/hooks/useToast";
 import { InspectorConfig } from "@/lib/configurationTypes";
@@ -40,6 +41,7 @@ interface CredentialEntry {
   expiresInMs: number | null;
   scopes: string[];
   clientId: string;
+  sourceFile: string;
 }
 
 /** Raw credential data from the file */
@@ -52,13 +54,14 @@ interface RawCredentials {
     expires_at: number;
     refresh_token: string;
     scopes: string[];
+    _sourceFile?: string;
   };
 }
 
 interface CredentialsTabProps {
   config: InspectorConfig;
-  credentialsFilePath: string;
-  setCredentialsFilePath: (path: string) => void;
+  credentialsFolderPath: string;
+  setCredentialsFolderPath: (path: string) => void;
   enabledCredentials: Set<string>;
   setEnabledCredentials: (keys: Set<string>) => void;
   rawCredentials: RawCredentials | null;
@@ -82,8 +85,8 @@ function formatDuration(ms: number): string {
 
 const CredentialsTab = ({
   config,
-  credentialsFilePath,
-  setCredentialsFilePath,
+  credentialsFolderPath,
+  setCredentialsFolderPath,
   enabledCredentials,
   setEnabledCredentials,
   rawCredentials,
@@ -98,23 +101,27 @@ const CredentialsTab = ({
 
   // [CREDENTIALS] Log component render state
   console.log("[CredentialsTab] Render", {
-    credentialsFilePath,
+    credentialsFolderPath,
     entriesCount: entries.length,
     enabledCount: enabledCredentials.size,
     hasRawCredentials: !!rawCredentials,
   });
 
-  // Load credentials from file
+  // Load credentials from folder (reads all .json files)
   const loadCredentials = useCallback(
-    async (filePath?: string) => {
-      const pathToLoad = filePath || credentialsFilePath;
+    async (folderPath?: string) => {
+      const pathToLoad = folderPath || credentialsFolderPath;
       if (!pathToLoad) {
-        console.log("[CredentialsTab] No credentials file path, skipping load");
+        console.log(
+          "[CredentialsTab] No credentials folder path, skipping load",
+        );
         return;
       }
 
       setIsLoading(true);
-      console.log(`[CredentialsTab] Loading credentials from: ${pathToLoad}`);
+      console.log(
+        `[CredentialsTab] Loading credentials from folder: ${pathToLoad}`,
+      );
 
       try {
         const baseUrl = getMCPProxyAddress(config);
@@ -143,8 +150,10 @@ const CredentialsTab = ({
 
         const data = await resp.json();
         console.log(
-          `[CredentialsTab] Loaded ${data.count} credential(s)`,
-          data.entries?.map((e: CredentialEntry) => e.serverName),
+          `[CredentialsTab] Loaded ${data.count} credential(s) from ${data.files?.length || 0} file(s)`,
+          data.entries?.map(
+            (e: CredentialEntry) => `${e.serverName} (${e.sourceFile})`,
+          ),
         );
 
         setEntries(data.entries || []);
@@ -173,7 +182,7 @@ const CredentialsTab = ({
     },
     [
       config,
-      credentialsFilePath,
+      credentialsFolderPath,
       enabledCredentials.size,
       setEnabledCredentials,
       setRawCredentials,
@@ -183,22 +192,22 @@ const CredentialsTab = ({
 
   // Load credentials on mount if path exists
   useEffect(() => {
-    if (credentialsFilePath) {
+    if (credentialsFolderPath) {
       console.log(
         "[CredentialsTab] Auto-loading credentials on mount/path change",
       );
       loadCredentials();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [credentialsFilePath]);
+  }, [credentialsFolderPath]);
 
-  // Handle choosing a file via native picker
-  const handleChooseFile = useCallback(async () => {
-    console.log("[CredentialsTab] Opening file picker");
+  // Handle choosing a folder via native picker
+  const handleChooseFolder = useCallback(async () => {
+    console.log("[CredentialsTab] Opening folder picker");
     try {
       const baseUrl = getMCPProxyAddress(config);
       const { token, header } = getMCPProxyAuthToken(config);
-      const resp = await fetch(`${baseUrl}/credentials/choose-file`, {
+      const resp = await fetch(`${baseUrl}/credentials/choose-folder`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -210,28 +219,28 @@ const CredentialsTab = ({
         const data = await resp.json();
         if (!data.cancelled && data.path) {
           console.log(
-            "[CredentialsTab] File chosen:",
+            "[CredentialsTab] Folder chosen:",
             data.path,
             data.absolutePath,
           );
-          setCredentialsFilePath(data.path);
-          localStorage.setItem("credentialsFilePath", data.path);
+          setCredentialsFolderPath(data.path);
+          localStorage.setItem("credentialsFolderPath", data.path);
           loadCredentials(data.path);
         } else {
-          console.log("[CredentialsTab] File picker cancelled");
+          console.log("[CredentialsTab] Folder picker cancelled");
         }
       }
     } catch (err) {
-      console.error("[CredentialsTab] Error choosing file:", err);
+      console.error("[CredentialsTab] Error choosing folder:", err);
       toast({
         title: "Error",
-        description: "Failed to open file picker",
+        description: "Failed to open folder picker",
         variant: "destructive",
       });
     }
-  }, [config, setCredentialsFilePath, loadCredentials, toast]);
+  }, [config, setCredentialsFolderPath, loadCredentials, toast]);
 
-  // [DRAG-DROP] Handle file drop — read content and upload to server
+  // [DRAG-DROP] Handle file drop — read content and upload to server into the selected folder
   const handleFileDrop = useCallback(
     async (file: File) => {
       console.log(
@@ -285,6 +294,7 @@ const CredentialsTab = ({
           body: JSON.stringify({
             content,
             fileName: file.name,
+            folderPath: credentialsFolderPath || undefined,
           }),
         });
 
@@ -301,30 +311,21 @@ const CredentialsTab = ({
 
         const data = await resp.json();
         console.log(
-          `[CredentialsTab:dragDrop] Upload success: path=${data.path}, count=${data.count}`,
+          `[CredentialsTab:dragDrop] Upload success: folder=${data.folderPath}, file=${data.fileName}, count=${data.count}`,
         );
 
-        // Update state with the uploaded data
-        setCredentialsFilePath(data.path);
-        localStorage.setItem("credentialsFilePath", data.path);
-        setEntries(data.entries || []);
-        setRawCredentials(data.credentials || null);
-
-        // Auto-enable all credentials
-        if (data.entries?.length > 0) {
-          const allKeys = new Set<string>(
-            data.entries.map((e: CredentialEntry) => e.key),
-          );
-          setEnabledCredentials(allKeys);
-          localStorage.setItem(
-            "enabledCredentials",
-            JSON.stringify([...allKeys]),
-          );
+        // Update folder path if not set yet
+        if (!credentialsFolderPath && data.folderPath) {
+          setCredentialsFolderPath(data.folderPath);
+          localStorage.setItem("credentialsFolderPath", data.folderPath);
         }
+
+        // Reload all credentials from the folder
+        loadCredentials(data.folderPath || credentialsFolderPath);
 
         toast({
           title: "Credentials Loaded",
-          description: `Loaded ${data.count} credential(s) from ${file.name}`,
+          description: `Saved ${file.name} with ${data.count} credential(s) to folder`,
         });
       } catch (error) {
         console.error("[CredentialsTab:dragDrop] Error:", error);
@@ -339,16 +340,14 @@ const CredentialsTab = ({
     },
     [
       config,
-      setCredentialsFilePath,
-      setEnabledCredentials,
-      setRawCredentials,
+      credentialsFolderPath,
+      setCredentialsFolderPath,
+      loadCredentials,
       toast,
     ],
   );
 
   // [DRAG-DROP] Window-level event listeners to prevent browser default file-open
-  // React event handlers alone are insufficient because the browser intercepts
-  // the drop at the window level before it reaches any React element.
   useEffect(() => {
     const onDragEnter = (e: DragEvent) => {
       e.preventDefault();
@@ -438,10 +437,12 @@ const CredentialsTab = ({
 
   // Refresh a credential's token
   const handleRefreshToken = useCallback(
-    async (credentialKey: string) => {
-      if (!credentialsFilePath) return;
+    async (credentialKey: string, sourceFile: string) => {
+      if (!credentialsFolderPath) return;
 
-      console.log(`[CredentialsTab] Refreshing token for: ${credentialKey}`);
+      console.log(
+        `[CredentialsTab] Refreshing token for: ${credentialKey} in file: ${sourceFile}`,
+      );
       setRefreshingKey(credentialKey);
 
       try {
@@ -454,7 +455,8 @@ const CredentialsTab = ({
             [header]: token ? `Bearer ${token}` : "",
           },
           body: JSON.stringify({
-            path: credentialsFilePath,
+            folderPath: credentialsFolderPath,
+            sourceFile,
             credentialKey,
           }),
         });
@@ -492,29 +494,39 @@ const CredentialsTab = ({
         setRefreshingKey(null);
       }
     },
-    [config, credentialsFilePath, loadCredentials, toast],
+    [config, credentialsFolderPath, loadCredentials, toast],
   );
 
   // Compute expiry status for a credential
   const getExpiryStatus = (
     entry: CredentialEntry,
-  ): { icon: React.ReactNode; label: string; color: string } => {
+  ): {
+    icon: React.ReactNode;
+    label: string;
+    color: string;
+    tooltip: string;
+  } => {
     if (!entry.expiresAt) {
       return {
         icon: <AlertTriangle className="w-4 h-4" />,
         label: "No expiry info",
         color: "text-yellow-500",
+        tooltip: "No expiration timestamp available",
       };
     }
 
+    const expiryDate = new Date(entry.expiresAt);
+    const formattedDate = expiryDate.toLocaleString();
     const now = Date.now();
     const msLeft = entry.expiresAt - now;
 
     if (msLeft <= 0) {
+      const agoMs = Math.abs(msLeft);
       return {
         icon: <XCircle className="w-4 h-4" />,
         label: "Expired",
         color: "text-red-500",
+        tooltip: `Expired at ${formattedDate} (${formatDuration(agoMs)} ago)`,
       };
     }
 
@@ -523,6 +535,7 @@ const CredentialsTab = ({
         icon: <AlertTriangle className="w-4 h-4" />,
         label: `Expires in ${formatDuration(msLeft)}`,
         color: "text-red-500",
+        tooltip: `Expires at ${formattedDate}`,
       };
     }
 
@@ -531,6 +544,7 @@ const CredentialsTab = ({
         icon: <Clock className="w-4 h-4" />,
         label: `Expires in ${formatDuration(msLeft)}`,
         color: "text-yellow-500",
+        tooltip: `Expires at ${formattedDate}`,
       };
     }
 
@@ -538,8 +552,20 @@ const CredentialsTab = ({
       icon: <CheckCircle2 className="w-4 h-4" />,
       label: `Valid for ${formatDuration(msLeft)}`,
       color: "text-green-500",
+      tooltip: `Expires at ${formattedDate}`,
     };
   };
+
+  // Group entries by source file for display
+  const entriesByFile = entries.reduce(
+    (acc, entry) => {
+      const file = entry.sourceFile || "unknown";
+      if (!acc[file]) acc[file] = [];
+      acc[file].push(entry);
+      return acc;
+    },
+    {} as Record<string, CredentialEntry[]>,
+  );
 
   return (
     <TabsContent value="credentials">
@@ -557,17 +583,17 @@ const CredentialsTab = ({
             <Button
               variant="outline"
               size="sm"
-              onClick={handleChooseFile}
+              onClick={handleChooseFolder}
               disabled={isLoading}
             >
               {isLoading ? (
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
               ) : (
-                <Upload className="w-4 h-4 mr-2" />
+                <FolderOpen className="w-4 h-4 mr-2" />
               )}
-              {credentialsFilePath ? "Change File" : "Load Credentials"}
+              {credentialsFolderPath ? "Change Folder" : "Choose Folder"}
             </Button>
-            {credentialsFilePath && (
+            {credentialsFolderPath && (
               <Button
                 variant="outline"
                 size="sm"
@@ -583,11 +609,16 @@ const CredentialsTab = ({
           </div>
         </div>
 
-        {/* File path display */}
-        {credentialsFilePath && (
+        {/* Folder path display */}
+        {credentialsFolderPath && (
           <div className="flex items-center gap-2 text-sm text-muted-foreground px-1">
-            <FileText className="w-3.5 h-3.5 shrink-0" />
-            <span className="truncate">{credentialsFilePath}</span>
+            <FolderOpen className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">{credentialsFolderPath}</span>
+            {Object.keys(entriesByFile).length > 0 && (
+              <Badge variant="outline" className="text-xs shrink-0">
+                {Object.keys(entriesByFile).length} file(s)
+              </Badge>
+            )}
           </div>
         )}
 
@@ -600,36 +631,39 @@ const CredentialsTab = ({
                 Drop credentials file here
               </p>
               <p className="text-sm text-muted-foreground">
-                Supports .json credential files
+                {credentialsFolderPath
+                  ? `File will be saved to ${credentialsFolderPath}`
+                  : "File will be saved to ./data/"}
               </p>
             </div>
           </div>
         )}
 
-        {/* Empty state — with drag-drop hint */}
-        {!credentialsFilePath && !isDragOver && (
+        {/* Empty state */}
+        {!credentialsFolderPath && !isDragOver && (
           <Card>
             <CardContent className="py-8">
               <div className="flex flex-col items-center justify-center text-center space-y-3">
                 <Shield className="w-12 h-12 text-muted-foreground/30" />
                 <div>
                   <p className="text-lg font-medium text-muted-foreground">
-                    No Credentials Loaded
+                    No Credentials Folder Selected
                   </p>
                   <p className="text-sm text-muted-foreground/70 mt-1 max-w-md">
-                    Load a <code>.credentials.json</code> file to manage OAuth
-                    tokens for MCP servers like Datadog. Credentials will be
-                    automatically injected when executing tools.
+                    Choose a folder containing <code>.json</code> credential
+                    files to manage OAuth tokens for MCP servers. Each JSON file
+                    in the folder will be loaded as a separate credential
+                    source.
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
-                  <Button variant="default" onClick={handleChooseFile}>
-                    <Upload className="w-4 h-4 mr-2" />
-                    Choose File
+                  <Button variant="default" onClick={handleChooseFolder}>
+                    <FolderOpen className="w-4 h-4 mr-2" />
+                    Choose Folder
                   </Button>
                   <span className="text-sm text-muted-foreground">or</span>
                   <div className="border-2 border-dashed border-muted-foreground/30 rounded-lg px-4 py-2 text-sm text-muted-foreground">
-                    Drag & drop a .json file here
+                    Drag & drop .json files here
                   </div>
                 </div>
               </div>
@@ -637,116 +671,142 @@ const CredentialsTab = ({
           </Card>
         )}
 
-        {/* Credentials list */}
-        {entries.length > 0 && (
-          <div className="space-y-3">
-            {entries.map((entry) => {
-              const isEnabled = enabledCredentials.has(entry.key);
-              const expiryStatus = getExpiryStatus(entry);
-              const isRefreshing = refreshingKey === entry.key;
+        {/* Credentials list, grouped by source file */}
+        {Object.keys(entriesByFile).length > 0 && (
+          <div className="space-y-4">
+            {Object.entries(entriesByFile).map(([fileName, fileEntries]) => (
+              <div key={fileName} className="space-y-2">
+                {/* File header */}
+                <div className="flex items-center gap-2 text-xs text-muted-foreground px-1">
+                  <FileText className="w-3.5 h-3.5" />
+                  <span className="font-medium">{fileName}</span>
+                  <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                    {fileEntries.length}
+                  </Badge>
+                </div>
 
-              return (
-                <Card
-                  key={entry.key}
-                  className={`transition-all duration-200 ${
-                    !isEnabled ? "opacity-50 bg-muted/30" : ""
-                  }`}
-                >
-                  <CardHeader className="pb-2">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <Server className="w-5 h-5 text-muted-foreground" />
-                        <div>
-                          <CardTitle className="text-base">
-                            {entry.serverName}
-                          </CardTitle>
-                          <CardDescription className="flex items-center gap-1.5 mt-0.5">
-                            <Globe className="w-3 h-3" />
-                            <span className="truncate max-w-[300px]">
-                              {entry.serverUrl}
-                            </span>
-                          </CardDescription>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        {/* Expiry status */}
-                        <div
-                          className={`flex items-center gap-1.5 text-xs ${expiryStatus.color}`}
-                        >
-                          {expiryStatus.icon}
-                          <span>{expiryStatus.label}</span>
-                        </div>
-                        {/* Refresh button */}
-                        {entry.hasRefreshToken && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleRefreshToken(entry.key)}
-                            disabled={isRefreshing || !isEnabled}
-                            title="Refresh token"
-                          >
-                            {isRefreshing ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                              <RefreshCw className="w-4 h-4" />
+                {/* Entries for this file */}
+                {fileEntries.map((entry) => {
+                  const isEnabled = enabledCredentials.has(entry.key);
+                  const expiryStatus = getExpiryStatus(entry);
+                  const isRefreshing = refreshingKey === entry.key;
+
+                  return (
+                    <Card
+                      key={entry.key}
+                      className={`transition-all duration-200 ${
+                        !isEnabled ? "opacity-50 bg-muted/30" : ""
+                      }`}
+                    >
+                      <CardHeader className="pb-2">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <Server className="w-5 h-5 text-muted-foreground" />
+                            <div>
+                              <CardTitle className="text-base">
+                                {entry.serverName}
+                              </CardTitle>
+                              <CardDescription className="flex items-center gap-1.5 mt-0.5">
+                                <Globe className="w-3 h-3" />
+                                <span className="truncate max-w-[300px]">
+                                  {entry.serverUrl}
+                                </span>
+                              </CardDescription>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            {/* Expiry status */}
+                            <div
+                              className={`flex items-center gap-1.5 text-xs cursor-default ${expiryStatus.color}`}
+                              title={expiryStatus.tooltip}
+                            >
+                              {expiryStatus.icon}
+                              <span>{expiryStatus.label}</span>
+                            </div>
+                            {/* Refresh button */}
+                            {entry.hasRefreshToken && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() =>
+                                  handleRefreshToken(
+                                    entry.key,
+                                    entry.sourceFile,
+                                  )
+                                }
+                                disabled={isRefreshing || !isEnabled}
+                                title="Refresh token"
+                              >
+                                {isRefreshing ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <RefreshCw className="w-4 h-4" />
+                                )}
+                              </Button>
                             )}
-                          </Button>
-                        )}
-                        {/* Enable/disable toggle */}
-                        <Switch
-                          checked={isEnabled}
-                          onCheckedChange={() =>
-                            handleToggleCredential(entry.key)
-                          }
-                        />
-                      </div>
-                    </div>
-                  </CardHeader>
-                  <CardContent className="pt-0 pb-3">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <Badge
-                        variant={
-                          entry.hasAccessToken ? "default" : "destructive"
-                        }
-                        className="text-xs"
-                      >
-                        <Key className="w-3 h-3 mr-1" />
-                        {entry.hasAccessToken
-                          ? "Access Token"
-                          : "No Access Token"}
-                      </Badge>
-                      {entry.hasRefreshToken && (
-                        <Badge variant="outline" className="text-xs">
-                          <RefreshCw className="w-3 h-3 mr-1" />
-                          Refresh Token
-                        </Badge>
-                      )}
-                      {entry.scopes.length > 0 && (
-                        <Badge variant="outline" className="text-xs">
-                          {entry.scopes.length} scopes
-                        </Badge>
-                      )}
-                      {entry.clientId && (
-                        <Badge variant="outline" className="text-xs font-mono">
-                          {entry.clientId.substring(0, 20)}...
-                        </Badge>
-                      )}
-                    </div>
-                  </CardContent>
-                </Card>
-              );
-            })}
+                            {/* Enable/disable toggle */}
+                            <Switch
+                              checked={isEnabled}
+                              onCheckedChange={() =>
+                                handleToggleCredential(entry.key)
+                              }
+                            />
+                          </div>
+                        </div>
+                      </CardHeader>
+                      <CardContent className="pt-0 pb-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Badge
+                            variant={
+                              entry.hasAccessToken ? "default" : "destructive"
+                            }
+                            className="text-xs"
+                          >
+                            <Key className="w-3 h-3 mr-1" />
+                            {entry.hasAccessToken
+                              ? "Access Token"
+                              : "No Access Token"}
+                          </Badge>
+                          {entry.hasRefreshToken && (
+                            <Badge variant="outline" className="text-xs">
+                              <RefreshCw className="w-3 h-3 mr-1" />
+                              Refresh Token
+                            </Badge>
+                          )}
+                          {entry.scopes.length > 0 && (
+                            <Badge variant="outline" className="text-xs">
+                              {entry.scopes.length} scopes
+                            </Badge>
+                          )}
+                          {entry.clientId && (
+                            <Badge
+                              variant="outline"
+                              className="text-xs font-mono"
+                            >
+                              {entry.clientId.substring(0, 20)}...
+                            </Badge>
+                          )}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            ))}
           </div>
         )}
 
-        {/* Loading state when file is loaded but entries empty */}
-        {credentialsFilePath && entries.length === 0 && !isLoading && (
+        {/* Loading state when folder is set but entries empty */}
+        {credentialsFolderPath && entries.length === 0 && !isLoading && (
           <Card>
             <CardContent className="py-6">
               <div className="flex flex-col items-center justify-center text-center space-y-2">
                 <AlertTriangle className="w-8 h-8 text-yellow-500/50" />
                 <p className="text-sm text-muted-foreground">
-                  No credential entries found in the file.
+                  No .json credential files found in the folder.
+                </p>
+                <p className="text-xs text-muted-foreground/70">
+                  Drop .json files here or add them to the folder.
                 </p>
               </div>
             </CardContent>

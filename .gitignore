@@ -19,4 +19,5 @@ client/e2e/test-results/
 mcp.json
 .claude/settings.local.json
 server/logs/
+data/
 .atom8n/My Board copy.kanban

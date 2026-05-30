@@ -239,8 +239,8 @@ const App = () => {
   }, [sidebarCollapsed]);
   const [configRefreshKey, setConfigRefreshKey] = useState(0);
   // [CREDENTIALS] State for credential management
-  const [credentialsFilePath, setCredentialsFilePath] = useState<string>(
-    () => localStorage.getItem("credentialsFilePath") || "",
+  const [credentialsFolderPath, setCredentialsFolderPath] = useState<string>(
+    () => localStorage.getItem("credentialsFolderPath") || "./data",
   );
   const [enabledCredentials, setEnabledCredentials] = useState<Set<string>>(
     () => {
@@ -1836,8 +1836,8 @@ const App = () => {
                       <TabsContent value="credentials">
                         <CredentialsTab
                           config={config}
-                          credentialsFilePath={credentialsFilePath}
-                          setCredentialsFilePath={setCredentialsFilePath}
+                          credentialsFolderPath={credentialsFolderPath}
+                          setCredentialsFolderPath={setCredentialsFolderPath}
                           enabledCredentials={enabledCredentials}
                           setEnabledCredentials={setEnabledCredentials}
                           rawCredentials={rawCredentials}
@@ -1902,8 +1902,8 @@ const App = () => {
                 <TabsContent value="credentials">
                   <CredentialsTab
                     config={config}
-                    credentialsFilePath={credentialsFilePath}
-                    setCredentialsFilePath={setCredentialsFilePath}
+                    credentialsFolderPath={credentialsFolderPath}
+                    setCredentialsFolderPath={setCredentialsFolderPath}
                     enabledCredentials={enabledCredentials}
                     setEnabledCredentials={setEnabledCredentials}
                     rawCredentials={rawCredentials}
