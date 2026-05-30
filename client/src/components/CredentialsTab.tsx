@@ -962,8 +962,12 @@ const CredentialsTab = ({
 
       try {
         const proxyKey = getProxyServerKey(entry);
+        // [PROXY] Point to the LOCAL proxy server at port 6277, NOT the remote server directly.
+        // The /mcp endpoint uses query params to know which upstream server to proxy to.
+        const proxyBaseUrl = getMCPProxyAddress(config);
+        const proxyUrl = `${proxyBaseUrl}/mcp?url=${encodeURIComponent(entry.serverUrl)}&transportType=streamable-http`;
         const proxyServerConfig = {
-          url: entry.serverUrl,
+          url: proxyUrl,
           type: "streamable-http",
           disabled: false,
         };
@@ -1247,8 +1251,12 @@ const CredentialsTab = ({
 
     const proxyKey = getProxyServerKey(proxyEntry);
 
+    // [PROXY] Point to the LOCAL proxy server, NOT the remote server directly.
+    // The /mcp endpoint uses query params to know which upstream server to proxy to.
+    const proxyBaseUrl = getMCPProxyAddress(config);
+    const proxyUrl = `${proxyBaseUrl}/mcp?url=${encodeURIComponent(proxyEntry.serverUrl)}&transportType=streamable-http`;
     const serverConfig: Record<string, unknown> = {
-      url: proxyEntry.serverUrl,
+      url: proxyUrl,
       type: "streamable-http",
     };
 
@@ -1268,7 +1276,7 @@ const CredentialsTab = ({
       title: "Copied",
       description: "MCP server config copied to clipboard",
     });
-  }, [proxyEntry, getProxyServerKey, toast]);
+  }, [proxyEntry, getProxyServerKey, config, toast]);
 
   // [PROXY] Copy curl command to clipboard
   const handleCopyCurl = useCallback(() => {
