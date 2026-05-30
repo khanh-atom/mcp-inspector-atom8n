@@ -416,6 +416,16 @@ const App = () => {
         serverConfig.type === "streamable-http" ? "streamable-http" : "sse";
       setTransportType(newTransport);
       setSseUrl(newUrl);
+      // If a bearer token is provided (e.g., from stored credentials), set it as auth header
+      if (serverConfig.bearerToken) {
+        setCustomHeaders([
+          {
+            name: "Authorization",
+            value: `Bearer ${serverConfig.bearerToken}`,
+            enabled: true,
+          },
+        ]);
+      }
       pendingTestConnectRef.current = {
         sseUrl: newUrl,
         transportType: newTransport,

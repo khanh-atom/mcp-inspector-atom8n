@@ -525,9 +525,12 @@ const CredentialsTab = ({
 
       if (onTestConnection) {
         // Build a server config matching what App.handleTestConnection expects
+        // Include the stored access token so the connection is authenticated
+        const cred = rawCredentials?.[entry.key];
         onTestConnection({
           type: "streamable-http",
           url: entry.serverUrl,
+          bearerToken: cred?.access_token || undefined,
         });
       } else {
         toast({
