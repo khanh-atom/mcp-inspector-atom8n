@@ -1604,6 +1604,7 @@ app.post(
 // ── Credential Token Refresh Helpers ─────────────────────────────────────────
 // Extracted from /credentials/refresh so it can be reused by /execute-tool.
 const DEFAULT_CREDENTIALS_FOLDER = "./data";
+const CREDENTIALS_STATE_FILE = "state.json";
 let activeCredentialsFolderPath =
   process.env.MCP_CREDENTIALS_FOLDER || DEFAULT_CREDENTIALS_FOLDER;
 
@@ -1649,7 +1650,16 @@ interface LocatedCredential {
   credential: CredentialRecord;
 }
 
-function enabledCredentialsStatePath(folderPath?: string): string {
+function credentialsStatePath(folderPath?: string): string {
+  return path.join(
+    path.resolve(
+      expandTildePath(getEffectiveCredentialsFolderPath(folderPath)),
+    ),
+    CREDENTIALS_STATE_FILE,
+  );
+}
+
+function legacyEnabledCredentialsStatePath(folderPath?: string): string {
   return path.join(
     path.resolve(
       expandTildePath(getEffectiveCredentialsFolderPath(folderPath)),
@@ -1658,26 +1668,64 @@ function enabledCredentialsStatePath(folderPath?: string): string {
   );
 }
 
+function getEnabledCredentialKeysFromState(parsed: unknown): string[] | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const state = parsed as {
+    enabledCredentialKeys?: unknown;
+    credentials?: { enabledCredentialKeys?: unknown };
+  };
+  const keys =
+    state.credentials?.enabledCredentialKeys ?? state.enabledCredentialKeys;
+  if (!Array.isArray(keys)) return null;
+  return keys.filter(
+    (value: unknown): value is string => typeof value === "string",
+  );
+}
+
 async function readPersistedEnabledCredentialKeys(
   folderPath?: string,
 ): Promise<string[] | null> {
-  const statePath = enabledCredentialsStatePath(folderPath);
+  const statePath = credentialsStatePath(folderPath);
   try {
     const fileContent = await fs.readFile(statePath, "utf8");
     const parsed = JSON.parse(fileContent);
-    if (!Array.isArray(parsed.enabledCredentialKeys)) {
+    const enabledKeys = getEnabledCredentialKeysFromState(parsed);
+    if (!enabledKeys) {
       logger.warn(
         `[credentials:enabled] Invalid enabled state file shape: ${statePath}`,
       );
       return null;
     }
-    return parsed.enabledCredentialKeys.filter(
-      (value: unknown): value is string => typeof value === "string",
-    );
+    return enabledKeys;
   } catch (error: any) {
     if (error?.code !== "ENOENT") {
       logger.warn(
         `[credentials:enabled] Failed to read enabled state file ${statePath}:`,
+        error,
+      );
+      return null;
+    }
+  }
+
+  const legacyStatePath = legacyEnabledCredentialsStatePath(folderPath);
+  try {
+    const fileContent = await fs.readFile(legacyStatePath, "utf8");
+    const parsed = JSON.parse(fileContent);
+    const enabledKeys = getEnabledCredentialKeysFromState(parsed);
+    if (!enabledKeys) {
+      logger.warn(
+        `[credentials:enabled] Invalid legacy enabled state file shape: ${legacyStatePath}`,
+      );
+      return null;
+    }
+    logger.info(
+      `[credentials:enabled] Loaded enabled credential state from legacy file ${legacyStatePath}`,
+    );
+    return enabledKeys;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      logger.warn(
+        `[credentials:enabled] Failed to read legacy enabled state file ${legacyStatePath}:`,
         error,
       );
     }
@@ -1693,19 +1741,27 @@ async function writePersistedEnabledCredentialKeys(
     expandTildePath(getEffectiveCredentialsFolderPath(folderPath)),
   );
   await fs.mkdir(folder, { recursive: true });
-  const statePath = enabledCredentialsStatePath(folder);
-  await fs.writeFile(
-    statePath,
-    JSON.stringify(
-      {
-        enabledCredentialKeys,
-        updatedAt: new Date().toISOString(),
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
+  const statePath = credentialsStatePath(folder);
+  let state: Record<string, any> = {};
+  try {
+    state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      logger.warn(
+        `[credentials:enabled] Replacing unreadable state file ${statePath}:`,
+        error,
+      );
+    }
+  }
+
+  state.credentials = {
+    ...(state.credentials || {}),
+    enabledCredentialKeys,
+    updatedAt: new Date().toISOString(),
+  };
+  state.updatedAt = new Date().toISOString();
+
+  await fs.writeFile(statePath, JSON.stringify(state, null, 2), "utf8");
   logger.info(
     `[credentials:enabled] Persisted ${enabledCredentialKeys.length} enabled credential key(s) to ${statePath}`,
   );
@@ -1825,7 +1881,10 @@ async function findCredentialForServerUrl(
         continue;
       }
       jsonFiles = (await fs.readdir(folder)).filter(
-        (fileName) => fileName.endsWith(".json") && !fileName.startsWith("."),
+        (fileName) =>
+          fileName.endsWith(".json") &&
+          !fileName.startsWith(".") &&
+          fileName !== CREDENTIALS_STATE_FILE,
       );
       logger.info(
         `[credentials:lookup] Folder ${folder} has ${jsonFiles.length} JSON file(s)`,
@@ -2901,7 +2960,10 @@ app.get(
       // Read all .json files in the folder
       const dirEntries = await fs.readdir(folderPath);
       const jsonFiles = dirEntries.filter(
-        (f) => f.endsWith(".json") && !f.startsWith("."),
+        (f) =>
+          f.endsWith(".json") &&
+          !f.startsWith(".") &&
+          f !== CREDENTIALS_STATE_FILE,
       );
 
       logger.info(
