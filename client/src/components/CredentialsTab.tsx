@@ -37,7 +37,14 @@ import {
   Info,
   Zap,
   Pencil,
+  Download,
+  Trash2,
+  Network,
+  Search,
+  CheckSquare,
+  Square,
 } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "../lib/hooks/useToast";
 import { InspectorConfig } from "@/lib/configurationTypes";
 import { getMCPProxyAddress, getMCPProxyAuthToken } from "@/utils/configUtils";
@@ -79,6 +86,13 @@ interface CredentialTestServerConfig {
   bearerToken?: string;
 }
 
+/** [PROXY] Tool info returned from the credential-server-tools endpoint */
+interface ProxyToolInfo {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
 interface CredentialsTabProps {
   config: InspectorConfig;
   credentialsFolderPath: string;
@@ -90,6 +104,14 @@ interface CredentialsTabProps {
   onTestConnection?: (
     serverConfig: CredentialTestServerConfig,
   ) => void | Promise<void>;
+  /** [PROXY] Current MCP servers from config file */
+  currentServers?: Record<string, any>;
+  /** [PROXY] Callback to update servers state */
+  onServersChange?: (servers: Record<string, any>) => void;
+  /** [PROXY] Path to the active MCP config file */
+  configFilePath?: string;
+  /** [PROXY] Callback when config file is updated */
+  onConfigFileUpdated?: () => void;
 }
 
 /** Format milliseconds as a human-readable duration */
@@ -159,6 +181,10 @@ const CredentialsTab = ({
   rawCredentials,
   setRawCredentials,
   onTestConnection,
+  currentServers = {},
+  onServersChange,
+  configFilePath,
+  onConfigFileUpdated,
 }: CredentialsTabProps) => {
   const [entries, setEntries] = useState<CredentialEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -171,6 +197,18 @@ const CredentialsTab = ({
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCounterRef = useRef(0);
   const { toast } = useToast();
+
+  // [PROXY] State for proxy popup and install/uninstall
+  const [proxyEntry, setProxyEntry] = useState<CredentialEntry | null>(null);
+  const [proxyTools, setProxyTools] = useState<ProxyToolInfo[]>([]);
+  const [proxyToolsLoading, setProxyToolsLoading] = useState(false);
+  const [proxySelectedTools, setProxySelectedTools] = useState<Set<string>>(
+    new Set(),
+  );
+  const [proxySearchQuery, setProxySearchQuery] = useState("");
+  const [installingCredentialId, setInstallingCredentialId] = useState<
+    string | null
+  >(null);
 
   // [CREDENTIALS] Log component render state
   console.log("[CredentialsTab] Render", {
@@ -889,6 +927,407 @@ const CredentialsTab = ({
     toast,
   ]);
 
+  // ── [PROXY] Helper: derive a config key from a credential entry ──────────
+  const getProxyServerKey = useCallback((entry: CredentialEntry) => {
+    const name = entry.serverName
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    return `${name}-proxy`;
+  }, []);
+
+  // [PROXY] Check if a credential's proxy server is installed in config
+  const isCredentialInstalled = useCallback(
+    (entry: CredentialEntry): boolean => {
+      const proxyKey = getProxyServerKey(entry);
+      const installed = proxyKey in currentServers;
+      console.log(
+        `[CredentialsTab:proxy] isCredentialInstalled: ${proxyKey} = ${installed}`,
+      );
+      return installed;
+    },
+    [currentServers, getProxyServerKey],
+  );
+
+  // [PROXY] Install a proxy MCP server entry for this credential into config
+  const handleInstallCredential = useCallback(
+    async (entry: CredentialEntry) => {
+      const credentialId = getCredentialIdentity(entry);
+      console.log(
+        `[CredentialsTab:proxy] Installing proxy server for credential: ${entry.serverName}`,
+        { credentialId, serverUrl: entry.serverUrl },
+      );
+      setInstallingCredentialId(credentialId);
+
+      try {
+        const proxyKey = getProxyServerKey(entry);
+        const proxyServerConfig = {
+          url: entry.serverUrl,
+          type: "streamable-http",
+          disabled: false,
+        };
+
+        const updatedServers = {
+          ...currentServers,
+          [proxyKey]: proxyServerConfig,
+        };
+
+        console.log(
+          `[CredentialsTab:proxy] Adding server '${proxyKey}' to config`,
+          proxyServerConfig,
+        );
+
+        const baseUrl = getMCPProxyAddress(config);
+        const { token, header } = getMCPProxyAuthToken(config);
+
+        let updateUrl = `${baseUrl}/update-mcp-config`;
+        if (configFilePath) {
+          updateUrl += `?path=${encodeURIComponent(configFilePath)}`;
+        }
+
+        console.log(`[CredentialsTab:proxy] POST ${updateUrl}`);
+        const response = await fetch(updateUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [header]: token ? `Bearer ${token}` : "",
+          },
+          body: JSON.stringify({ servers: updatedServers }),
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          console.error("[CredentialsTab:proxy] Install failed:", errorData);
+          throw new Error(
+            errorData.message ||
+              `HTTP ${response.status}: ${response.statusText}`,
+          );
+        }
+
+        console.log(`[CredentialsTab:proxy] Install success for '${proxyKey}'`);
+
+        if (onServersChange) {
+          onServersChange(updatedServers);
+        }
+
+        toast({
+          title: "Proxy Server Installed",
+          description: `${entry.serverName} proxy has been added to your MCP configuration.`,
+        });
+
+        if (onConfigFileUpdated) {
+          onConfigFileUpdated();
+        }
+      } catch (error) {
+        console.error("[CredentialsTab:proxy] Install error:", error);
+        toast({
+          title: "Install Failed",
+          description: `Failed to install proxy: ${error instanceof Error ? error.message : String(error)}`,
+          variant: "destructive",
+        });
+      } finally {
+        setTimeout(() => setInstallingCredentialId(null), 500);
+      }
+    },
+    [
+      config,
+      configFilePath,
+      currentServers,
+      getProxyServerKey,
+      onConfigFileUpdated,
+      onServersChange,
+      toast,
+    ],
+  );
+
+  // [PROXY] Uninstall the proxy MCP server entry for this credential from config
+  const handleUninstallCredential = useCallback(
+    async (entry: CredentialEntry) => {
+      const credentialId = getCredentialIdentity(entry);
+      const proxyKey = getProxyServerKey(entry);
+      console.log(
+        `[CredentialsTab:proxy] Uninstalling proxy server '${proxyKey}' for credential: ${entry.serverName}`,
+      );
+      setInstallingCredentialId(credentialId);
+
+      try {
+        const updatedServers = { ...currentServers };
+        delete updatedServers[proxyKey];
+
+        console.log(
+          `[CredentialsTab:proxy] Removing server '${proxyKey}' from config`,
+        );
+
+        const baseUrl = getMCPProxyAddress(config);
+        const { token, header } = getMCPProxyAuthToken(config);
+
+        let updateUrl = `${baseUrl}/update-mcp-config`;
+        if (configFilePath) {
+          updateUrl += `?path=${encodeURIComponent(configFilePath)}`;
+        }
+
+        console.log(`[CredentialsTab:proxy] POST ${updateUrl}`);
+        const response = await fetch(updateUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [header]: token ? `Bearer ${token}` : "",
+          },
+          body: JSON.stringify({ servers: updatedServers }),
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          console.error("[CredentialsTab:proxy] Uninstall failed:", errorData);
+          throw new Error(
+            errorData.message ||
+              `HTTP ${response.status}: ${response.statusText}`,
+          );
+        }
+
+        console.log(
+          `[CredentialsTab:proxy] Uninstall success for '${proxyKey}'`,
+        );
+
+        if (onServersChange) {
+          onServersChange(updatedServers);
+        }
+
+        toast({
+          title: "Proxy Server Uninstalled",
+          description: `${entry.serverName} proxy has been removed from your MCP configuration.`,
+        });
+
+        if (onConfigFileUpdated) {
+          onConfigFileUpdated();
+        }
+      } catch (error) {
+        console.error("[CredentialsTab:proxy] Uninstall error:", error);
+        toast({
+          title: "Uninstall Failed",
+          description: `Failed to uninstall proxy: ${error instanceof Error ? error.message : String(error)}`,
+          variant: "destructive",
+        });
+      } finally {
+        setTimeout(() => setInstallingCredentialId(null), 500);
+      }
+    },
+    [
+      config,
+      configFilePath,
+      currentServers,
+      getProxyServerKey,
+      onConfigFileUpdated,
+      onServersChange,
+      toast,
+    ],
+  );
+
+  // [PROXY] Open the proxy config popup — fetches tools from server
+  const handleOpenProxy = useCallback(
+    async (entry: CredentialEntry) => {
+      console.log(
+        `[CredentialsTab:proxy] Opening proxy popup for: ${entry.serverName} (${entry.serverUrl})`,
+      );
+      setProxyEntry(entry);
+      setProxyTools([]);
+      setProxySelectedTools(new Set());
+      setProxySearchQuery("");
+      setProxyToolsLoading(true);
+
+      try {
+        const baseUrl = getMCPProxyAddress(config);
+        const { token, header } = getMCPProxyAuthToken(config);
+
+        const credentialRecord = getCredentialRecord(rawCredentials, entry);
+
+        const body: Record<string, unknown> = {
+          serverUrl: entry.serverUrl,
+          accessToken: credentialRecord?.access_token || undefined,
+          credentialsFolderPath: credentialsFolderPath || undefined,
+        };
+
+        // [PROXY] Provide credentialMeta so the server can auto-refresh if needed
+        if (entry.sourceFile && entry.key) {
+          body.credentialMeta = {
+            folderPath: credentialsFolderPath || "./data",
+            sourceFile: entry.sourceFile,
+            credentialKey: entry.key,
+          };
+        }
+
+        console.log(
+          `[CredentialsTab:proxy] Fetching tools from ${entry.serverUrl}`,
+        );
+        const resp = await fetch(`${baseUrl}/credential-server-tools`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [header]: token ? `Bearer ${token}` : "",
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          console.error("[CredentialsTab:proxy] Failed to fetch tools:", err);
+          toast({
+            title: "Failed to Load Tools",
+            description:
+              err.message || `HTTP ${resp.status}: ${resp.statusText}`,
+            variant: "destructive",
+          });
+          return;
+        }
+
+        const data = await resp.json();
+        const tools: ProxyToolInfo[] = data.tools || [];
+        console.log(
+          `[CredentialsTab:proxy] Loaded ${tools.length} tool(s) from ${entry.serverName}`,
+        );
+
+        setProxyTools(tools);
+        // All tools selected by default
+        setProxySelectedTools(new Set(tools.map((t) => t.name)));
+      } catch (error) {
+        console.error("[CredentialsTab:proxy] Error fetching tools:", error);
+        toast({
+          title: "Error",
+          description: `Failed to load tools: ${error instanceof Error ? error.message : String(error)}`,
+          variant: "destructive",
+        });
+      } finally {
+        setProxyToolsLoading(false);
+      }
+    },
+    [config, credentialsFolderPath, rawCredentials, toast],
+  );
+
+  // [PROXY] Close the proxy popup
+  const handleCloseProxy = useCallback(() => {
+    console.log("[CredentialsTab:proxy] Closing proxy popup");
+    setProxyEntry(null);
+    setProxyTools([]);
+    setProxySelectedTools(new Set());
+    setProxySearchQuery("");
+  }, []);
+
+  // [PROXY] Toggle a tool in the proxy selection
+  const handleToggleProxyTool = useCallback((toolName: string) => {
+    setProxySelectedTools((prev) => {
+      const next = new Set(prev);
+      if (next.has(toolName)) {
+        next.delete(toolName);
+        console.log(`[CredentialsTab:proxy] Deselected tool: ${toolName}`);
+      } else {
+        next.add(toolName);
+        console.log(`[CredentialsTab:proxy] Selected tool: ${toolName}`);
+      }
+      return next;
+    });
+  }, []);
+
+  // [PROXY] Select / deselect all tools
+  const handleSelectAllProxyTools = useCallback(() => {
+    const allNames = proxyTools.map((t) => t.name);
+    const allSelected = allNames.every((n) => proxySelectedTools.has(n));
+    if (allSelected) {
+      console.log("[CredentialsTab:proxy] Deselecting all tools");
+      setProxySelectedTools(new Set());
+    } else {
+      console.log("[CredentialsTab:proxy] Selecting all tools");
+      setProxySelectedTools(new Set(allNames));
+    }
+  }, [proxyTools, proxySelectedTools]);
+
+  // [PROXY] Copy MCP server config JSON to clipboard
+  const handleCopyProxyConfig = useCallback(() => {
+    if (!proxyEntry) return;
+
+    const proxyKey = getProxyServerKey(proxyEntry);
+
+    const serverConfig: Record<string, unknown> = {
+      url: proxyEntry.serverUrl,
+      type: "streamable-http",
+    };
+
+    const configJson = JSON.stringify(
+      {
+        mcpServers: {
+          [proxyKey]: serverConfig,
+        },
+      },
+      null,
+      2,
+    );
+
+    console.log(`[CredentialsTab:proxy] Copying MCP config for ${proxyKey}`);
+    navigator.clipboard.writeText(configJson);
+    toast({
+      title: "Copied",
+      description: "MCP server config copied to clipboard",
+    });
+  }, [proxyEntry, getProxyServerKey, toast]);
+
+  // [PROXY] Copy curl command to clipboard
+  const handleCopyCurl = useCallback(() => {
+    if (!proxyEntry) return;
+
+    const credentialRecord = getCredentialRecord(rawCredentials, proxyEntry);
+    const selectedToolNames = [...proxySelectedTools];
+
+    // Generate a curl command for each selected tool (or one with wildcard)
+    const toolName =
+      selectedToolNames.length === 1
+        ? selectedToolNames[0]
+        : selectedToolNames.length === proxyTools.length
+          ? "*"
+          : selectedToolNames.join(",");
+
+    const baseUrl = getMCPProxyAddress(config);
+
+    const curlParts = [
+      `curl -X POST ${baseUrl}/execute-tool \\`,
+      `  -H "Content-Type: application/json" \\`,
+    ];
+
+    if (credentialRecord?.access_token) {
+      curlParts.push(
+        `  -H "Authorization: Bearer ${credentialRecord.access_token}" \\`,
+      );
+    }
+
+    const bodyObj: Record<string, unknown> = {
+      toolName,
+      toolArgs: {},
+      server: {
+        name: proxyEntry.serverName,
+        type: "streamable-http",
+        url: proxyEntry.serverUrl,
+      },
+    };
+
+    curlParts.push(`  -d '${JSON.stringify(bodyObj, null, 2)}'`);
+
+    const curl = curlParts.join("\n");
+    console.log(
+      `[CredentialsTab:proxy] Copying curl for ${proxyEntry.serverName}, tool=${toolName}`,
+    );
+    navigator.clipboard.writeText(curl);
+    toast({
+      title: "Copied",
+      description: "Curl command copied to clipboard",
+    });
+  }, [
+    config,
+    proxyEntry,
+    proxySelectedTools,
+    proxyTools,
+    rawCredentials,
+    toast,
+  ]);
+
   // Compute expiry status for a credential
   const getExpiryStatus = (
     entry: CredentialEntry,
@@ -1361,6 +1800,68 @@ const CredentialsTab = ({
                               </div>
                             </DialogContent>
                           </Dialog>
+                          {/* [PROXY] Install / Uninstall / Proxy buttons */}
+                          {(() => {
+                            const installed = isCredentialInstalled(entry);
+                            const isInstalling =
+                              installingCredentialId === credentialId;
+                            return (
+                              <>
+                                {installed ? (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+                                    onClick={() =>
+                                      handleUninstallCredential(entry)
+                                    }
+                                    disabled={isInstalling}
+                                    title="Uninstall proxy server from MCP config"
+                                  >
+                                    {isInstalling ? (
+                                      <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                                    ) : (
+                                      <Trash2 className="w-3.5 h-3.5 mr-1" />
+                                    )}
+                                    Uninstall
+                                  </Button>
+                                ) : (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 px-2 text-xs"
+                                    onClick={() =>
+                                      handleInstallCredential(entry)
+                                    }
+                                    disabled={
+                                      isInstalling ||
+                                      !isEnabled ||
+                                      !entry.serverUrl
+                                    }
+                                    title="Install proxy server to MCP config"
+                                  >
+                                    {isInstalling ? (
+                                      <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                                    ) : (
+                                      <Download className="w-3.5 h-3.5 mr-1" />
+                                    )}
+                                    Install
+                                  </Button>
+                                )}
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 px-2 text-xs"
+                                  onClick={() => handleOpenProxy(entry)}
+                                  disabled={!isEnabled || !entry.serverUrl}
+                                  title="Open proxy config popup"
+                                >
+                                  <Network className="w-3.5 h-3.5 mr-1" />
+                                  Proxy
+                                </Button>
+                              </>
+                            );
+                          })()}
                         </div>
                       </CardContent>
                     </Card>
@@ -1444,6 +1945,139 @@ const CredentialsTab = ({
                 </Button>
               </DialogFooter>
             </form>
+          </DialogContent>
+        </Dialog>
+
+        {/* [PROXY] Proxy config popup */}
+        <Dialog
+          open={!!proxyEntry}
+          onOpenChange={(open) => {
+            if (!open) handleCloseProxy();
+          }}
+        >
+          <DialogContent className="max-w-lg max-h-[80vh] flex flex-col">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Network className="w-5 h-5" />
+                Proxy Config — {proxyEntry?.serverName}
+              </DialogTitle>
+              <DialogDescription className="flex items-center gap-1.5">
+                <Globe className="w-3 h-3" />
+                {proxyEntry?.serverUrl}
+              </DialogDescription>
+            </DialogHeader>
+
+            {/* [PROXY] Search input */}
+            <div className="relative">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                value={proxySearchQuery}
+                onChange={(e) => setProxySearchQuery(e.target.value)}
+                placeholder="Search tools..."
+                className="pl-9 h-8 text-sm"
+              />
+            </div>
+
+            {/* [PROXY] Select all / count */}
+            {proxyTools.length > 0 && (
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <button
+                  onClick={handleSelectAllProxyTools}
+                  className="flex items-center gap-1.5 hover:text-foreground transition-colors"
+                >
+                  {proxyTools.every((t) => proxySelectedTools.has(t.name)) ? (
+                    <CheckSquare className="w-3.5 h-3.5" />
+                  ) : (
+                    <Square className="w-3.5 h-3.5" />
+                  )}
+                  {proxyTools.every((t) => proxySelectedTools.has(t.name))
+                    ? "Deselect all"
+                    : "Select all"}
+                </button>
+                <span>
+                  {proxySelectedTools.size}/{proxyTools.length} selected
+                </span>
+              </div>
+            )}
+
+            {/* [PROXY] Tools list */}
+            <div className="flex-1 overflow-auto border rounded-md max-h-[300px]">
+              {proxyToolsLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                  <span className="ml-2 text-sm text-muted-foreground">
+                    Loading tools...
+                  </span>
+                </div>
+              ) : proxyTools.length === 0 ? (
+                <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                  No tools found
+                </div>
+              ) : (
+                <div className="divide-y">
+                  {proxyTools
+                    .filter(
+                      (tool) =>
+                        !proxySearchQuery ||
+                        tool.name
+                          .toLowerCase()
+                          .includes(proxySearchQuery.toLowerCase()) ||
+                        tool.description
+                          ?.toLowerCase()
+                          .includes(proxySearchQuery.toLowerCase()),
+                    )
+                    .map((tool) => (
+                      <label
+                        key={tool.name}
+                        className="flex items-start gap-3 px-3 py-2 hover:bg-muted/50 cursor-pointer transition-colors"
+                      >
+                        <Checkbox
+                          checked={proxySelectedTools.has(tool.name)}
+                          onCheckedChange={() =>
+                            handleToggleProxyTool(tool.name)
+                          }
+                          className="mt-0.5"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-medium truncate">
+                            {tool.name}
+                          </p>
+                          {tool.description && (
+                            <p className="text-xs text-muted-foreground line-clamp-2">
+                              {tool.description}
+                            </p>
+                          )}
+                        </div>
+                      </label>
+                    ))}
+                </div>
+              )}
+            </div>
+
+            {/* [PROXY] Footer actions */}
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleCopyProxyConfig}
+                disabled={!proxyEntry}
+              >
+                <Copy className="w-3.5 h-3.5 mr-1.5" />
+                Copy MCP Config
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleCopyCurl}
+                disabled={!proxyEntry || proxySelectedTools.size === 0}
+              >
+                <Copy className="w-3.5 h-3.5 mr-1.5" />
+                Copy curl
+              </Button>
+              <Button variant="ghost" size="sm" onClick={handleCloseProxy}>
+                Close
+              </Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       </div>

@@ -1856,6 +1856,12 @@ const App = () => {
                           rawCredentials={rawCredentials}
                           setRawCredentials={setRawCredentials}
                           onTestConnection={handleTestConnection}
+                          currentServers={currentServers}
+                          onServersChange={setCurrentServers}
+                          configFilePath={configFilePath}
+                          onConfigFileUpdated={() =>
+                            setConfigRefreshKey((k) => k + 1)
+                          }
                         />
                       </TabsContent>
                       <TabsContent value="store">
@@ -1923,6 +1929,12 @@ const App = () => {
                     rawCredentials={rawCredentials}
                     setRawCredentials={setRawCredentials}
                     onTestConnection={handleTestConnection}
+                    currentServers={currentServers}
+                    onServersChange={setCurrentServers}
+                    configFilePath={configFilePath}
+                    onConfigFileUpdated={() =>
+                      setConfigRefreshKey((k) => k + 1)
+                    }
                   />
                 </TabsContent>
                 <TabsContent value="store">

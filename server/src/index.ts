@@ -2229,6 +2229,215 @@ async function evictExecuteToolConnectionVariants(
   ]);
 }
 
+// [PROXY] List tools from a credential-authenticated MCP server
+// Used by the Proxy popup in CredentialsTab to show available tools
+app.post(
+  "/credential-server-tools",
+  originValidationMiddleware,
+  express.json(),
+  async (req, res) => {
+    const { serverUrl, accessToken, credentialMeta, credentialsFolderPath } =
+      req.body as {
+        serverUrl?: string;
+        accessToken?: string;
+        credentialMeta?: CredentialMeta;
+        credentialsFolderPath?: string;
+      };
+
+    console.log("[credential-server-tools] Request received", {
+      serverUrl,
+      hasAccessToken: Boolean(accessToken),
+      hasCredentialMeta: Boolean(credentialMeta),
+    });
+
+    if (!serverUrl) {
+      console.warn("[credential-server-tools] Missing serverUrl");
+      res.status(400).json({
+        error: "Bad Request",
+        message: "serverUrl is required",
+      });
+      return;
+    }
+
+    let effectiveAccessToken = accessToken;
+
+    // [PROXY] Always check credentialMeta for a fresher token, even if accessToken was provided
+    if (credentialMeta) {
+      console.log(
+        "[credential-server-tools] Checking credential via meta for freshest token",
+        credentialMeta,
+      );
+      try {
+        const located = await readCredentialByMeta(credentialMeta);
+
+        // Auto-refresh if expired (or about to expire within 60s)
+        const safetyMarginMs = 60_000;
+        if (
+          located.credential.expires_at &&
+          located.credential.expires_at <= Date.now() + safetyMarginMs
+        ) {
+          console.log(
+            "[credential-server-tools] Token expired or expiring soon, refreshing...",
+          );
+          const refreshResult = await refreshCredentialToken(credentialMeta);
+          effectiveAccessToken = refreshResult.accessToken;
+          console.log(
+            "[credential-server-tools] Token refreshed successfully, new expiry:",
+            new Date(refreshResult.expiresAt).toISOString(),
+          );
+        } else if (located.credential.access_token) {
+          // Use the on-disk token (may be newer than the one the client sent)
+          effectiveAccessToken = located.credential.access_token;
+          console.log(
+            "[credential-server-tools] Using on-disk token (not expired)",
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "[credential-server-tools] Failed to read/refresh credential via meta:",
+          error,
+        );
+      }
+    }
+
+    // [PROXY] If still no access token, try finding one by server URL
+    if (!effectiveAccessToken) {
+      console.log(
+        "[credential-server-tools] Attempting credential lookup by server URL",
+      );
+      try {
+        const located = await findCredentialForServerUrl(
+          serverUrl,
+          credentialsFolderPath,
+        );
+        if (located?.credential.access_token) {
+          effectiveAccessToken = located.credential.access_token;
+          console.log(
+            "[credential-server-tools] Found credential by URL match",
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "[credential-server-tools] Credential lookup by URL failed:",
+          error,
+        );
+      }
+    }
+
+    // [PROXY] Helper: attempt to connect and list tools with the given token
+    const attemptListTools = async (
+      token: string | undefined,
+    ): Promise<{
+      success: boolean;
+      tools?: any[];
+      error?: unknown;
+      is401?: boolean;
+    }> => {
+      let transport: Transport | null = null;
+      let client: Client | null = null;
+
+      try {
+        const headers: Record<string, string> = {
+          Accept: "text/event-stream, application/json",
+        };
+
+        if (token) {
+          headers["Authorization"] = `Bearer ${token}`;
+          console.log(
+            "[credential-server-tools] Injecting Authorization header",
+          );
+        } else {
+          console.log(
+            "[credential-server-tools] No access token available, connecting without auth",
+          );
+        }
+
+        const headerHolder = { headers };
+        console.log(`[credential-server-tools] Connecting to ${serverUrl}`);
+
+        transport = new StreamableHTTPClientTransport(new URL(serverUrl), {
+          fetch: createCustomFetch(headerHolder),
+        });
+
+        client = new Client({
+          name: "mcp-inspector-proxy-tool-lister",
+          version: "1.0.0",
+        });
+
+        await client.connect(transport);
+        console.log("[credential-server-tools] Connected successfully");
+
+        const toolsResponse = await client.listTools();
+        const tools = toolsResponse.tools || [];
+        console.log(`[credential-server-tools] Listed ${tools.length} tool(s)`);
+
+        return { success: true, tools };
+      } catch (error) {
+        const is401 = isUnauthorizedError(error);
+        console.error(
+          `[credential-server-tools] Error listing tools (is401=${is401}):`,
+          error,
+        );
+        return { success: false, error, is401 };
+      } finally {
+        try {
+          if (client) await client.close();
+          if (transport) await transport.close();
+          console.log("[credential-server-tools] Connection cleaned up");
+        } catch (cleanupError) {
+          console.warn(
+            "[credential-server-tools] Cleanup error:",
+            cleanupError,
+          );
+        }
+      }
+    };
+
+    // [PROXY] First attempt
+    let result = await attemptListTools(effectiveAccessToken);
+
+    // [PROXY] If 401 and we have credentialMeta, try refreshing token and retrying once
+    if (!result.success && result.is401 && credentialMeta) {
+      console.log(
+        "[credential-server-tools] Got 401, attempting token refresh and retry...",
+      );
+      try {
+        const refreshResult = await refreshCredentialToken(credentialMeta);
+        effectiveAccessToken = refreshResult.accessToken;
+        console.log(
+          "[credential-server-tools] Token refreshed for retry, new expiry:",
+          new Date(refreshResult.expiresAt).toISOString(),
+        );
+
+        result = await attemptListTools(effectiveAccessToken);
+      } catch (refreshError) {
+        console.error(
+          "[credential-server-tools] Token refresh for retry failed:",
+          refreshError,
+        );
+      }
+    }
+
+    if (result.success) {
+      res.json({
+        success: true,
+        serverUrl,
+        tools: result.tools,
+        count: result.tools?.length ?? 0,
+      });
+    } else {
+      res.status(500).json({
+        error: "Internal Server Error",
+        message:
+          result.error instanceof Error
+            ? result.error.message
+            : String(result.error),
+        serverUrl,
+      });
+    }
+  },
+);
+
 // New endpoint for on-demand tool execution (connections cached by serverName)
 // Supports automatic token refresh on 401 Unauthorized when credentials can be resolved.
 app.post(
