@@ -1842,6 +1842,7 @@ const App = () => {
                           setEnabledCredentials={setEnabledCredentials}
                           rawCredentials={rawCredentials}
                           setRawCredentials={setRawCredentials}
+                          onTestConnection={handleTestConnection}
                         />
                       </TabsContent>
                       <TabsContent value="store">
@@ -1908,6 +1909,7 @@ const App = () => {
                     setEnabledCredentials={setEnabledCredentials}
                     rawCredentials={rawCredentials}
                     setRawCredentials={setRawCredentials}
+                    onTestConnection={handleTestConnection}
                   />
                 </TabsContent>
                 <TabsContent value="store">

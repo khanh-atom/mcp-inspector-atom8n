@@ -33,6 +33,7 @@ import {
   FileText,
   Copy,
   Info,
+  Zap,
 } from "lucide-react";
 import { useToast } from "../lib/hooks/useToast";
 import { InspectorConfig } from "@/lib/configurationTypes";
@@ -75,6 +76,7 @@ interface CredentialsTabProps {
   setEnabledCredentials: (keys: Set<string>) => void;
   rawCredentials: RawCredentials | null;
   setRawCredentials: (creds: RawCredentials | null) => void;
+  onTestConnection?: (serverConfig: any) => void;
 }
 
 /** Format milliseconds as a human-readable duration */
@@ -100,6 +102,7 @@ const CredentialsTab = ({
   setEnabledCredentials,
   rawCredentials,
   setRawCredentials,
+  onTestConnection,
 }: CredentialsTabProps) => {
   const [entries, setEntries] = useState<CredentialEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -506,6 +509,36 @@ const CredentialsTab = ({
     [config, credentialsFolderPath, loadCredentials, toast],
   );
 
+  // Test connection to a server — delegates to App's handleTestConnection
+  const handleTestConnection = useCallback(
+    (entry: CredentialEntry) => {
+      if (!entry.serverUrl) {
+        toast({
+          title: "Cannot Test",
+          description: "Missing server URL",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      console.log(`[CredentialsTab] Testing connection to: ${entry.serverUrl}`);
+
+      if (onTestConnection) {
+        // Build a server config matching what App.handleTestConnection expects
+        onTestConnection({
+          type: "streamable-http",
+          url: entry.serverUrl,
+        });
+      } else {
+        toast({
+          title: "Test Connection",
+          description: `Would connect to ${entry.serverName} at ${entry.serverUrl}`,
+        });
+      }
+    },
+    [onTestConnection, toast],
+  );
+
   // Compute expiry status for a credential
   const getExpiryStatus = (
     entry: CredentialEntry,
@@ -765,32 +798,23 @@ const CredentialsTab = ({
                       </CardHeader>
                       <CardContent className="pt-0 pb-3">
                         <div className="flex items-center gap-2">
-                          <Badge
-                            variant={
-                              entry.hasAccessToken ? "default" : "destructive"
-                            }
-                            className="text-xs"
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            disabled={!isEnabled || !entry.hasAccessToken}
+                            onClick={() => handleTestConnection(entry)}
+                            title="Test connection to server"
                           >
-                            {entry.hasAccessToken
-                              ? "Access Token"
-                              : "No Access Token"}
-                          </Badge>
-                          {entry.hasRefreshToken && (
-                            <Badge variant="outline" className="text-xs">
-                              Refresh Token
-                            </Badge>
-                          )}
-                          {entry.scopes.length > 0 && (
-                            <Badge variant="outline" className="text-xs">
-                              {entry.scopes.length} scopes
-                            </Badge>
-                          )}
+                            <Zap className="w-3.5 h-3.5 mr-1" />
+                            Test
+                          </Button>
                           <Dialog>
                             <DialogTrigger asChild>
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                className="ml-auto h-7 px-2 text-xs"
+                                className="h-7 px-2 text-xs"
                               >
                                 <Info className="w-3.5 h-3.5 mr-1" />
                                 Info
