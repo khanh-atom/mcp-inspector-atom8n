@@ -44,6 +44,7 @@ import { getMCPProxyAddress, getMCPProxyAuthToken } from "@/utils/configUtils";
 
 /** Shape of a single credential entry as returned by GET /credentials */
 interface CredentialEntry {
+  id?: string;
   key: string;
   serverName: string;
   serverUrl: string;
@@ -68,6 +69,7 @@ interface RawCredentials {
     refresh_token: string;
     scopes: string[];
     _sourceFile?: string;
+    _credentialKey?: string;
   };
 }
 
@@ -104,6 +106,49 @@ function formatDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);
   return `${seconds}s`;
 }
+
+const CREDENTIAL_ID_PREFIX = "credential:";
+
+const createCredentialIdentity = (sourceFile: string, credentialKey: string) =>
+  `${CREDENTIAL_ID_PREFIX}${encodeURIComponent(sourceFile)}:${encodeURIComponent(credentialKey)}`;
+
+const getCredentialIdentity = (
+  entry: Pick<CredentialEntry, "id" | "sourceFile" | "key">,
+) => entry.id || createCredentialIdentity(entry.sourceFile, entry.key);
+
+const getCredentialRecord = (
+  rawCredentials: RawCredentials | null,
+  entry: Pick<CredentialEntry, "id" | "sourceFile" | "key">,
+) =>
+  rawCredentials?.[getCredentialIdentity(entry)] || rawCredentials?.[entry.key];
+
+const areStringSetsEqual = (left: Set<string>, right: Set<string>) =>
+  left.size === right.size && [...left].every((value) => right.has(value));
+
+const normalizeEnabledCredentialsForEntries = (
+  enabledCredentials: Set<string>,
+  entries: CredentialEntry[],
+) => {
+  const normalized = new Set<string>();
+
+  for (const enabledKey of enabledCredentials) {
+    const matchingEntries = entries.filter(
+      (entry) =>
+        enabledKey === getCredentialIdentity(entry) || enabledKey === entry.key,
+    );
+
+    if (matchingEntries.length === 0) {
+      normalized.add(enabledKey);
+      continue;
+    }
+
+    for (const entry of matchingEntries) {
+      normalized.add(getCredentialIdentity(entry));
+    }
+  }
+
+  return normalized;
+};
 
 const CredentialsTab = ({
   config,
@@ -184,18 +229,39 @@ const CredentialsTab = ({
           ),
         );
 
-        setEntries(data.entries || []);
+        const loadedEntries = (data.entries || []) as CredentialEntry[];
+        setEntries(loadedEntries);
         setRawCredentials(data.credentials || null);
 
         // Auto-enable all credentials on first load if none are enabled
-        if (enabledCredentials.size === 0 && data.entries?.length > 0) {
+        if (enabledCredentials.size === 0 && loadedEntries.length > 0) {
           const allKeys = new Set<string>(
-            data.entries.map((e: CredentialEntry) => e.key),
+            loadedEntries.map((entry) => getCredentialIdentity(entry)),
           );
           console.log("[CredentialsTab] Auto-enabling all credentials:", [
             ...allKeys,
           ]);
           setEnabledCredentials(allKeys);
+          localStorage.setItem(
+            "enabledCredentials",
+            JSON.stringify([...allKeys]),
+          );
+        } else if (loadedEntries.length > 0) {
+          const normalizedEnabled = normalizeEnabledCredentialsForEntries(
+            enabledCredentials,
+            loadedEntries,
+          );
+          if (!areStringSetsEqual(enabledCredentials, normalizedEnabled)) {
+            console.log(
+              "[CredentialsTab] Migrating enabled credential keys to file-aware ids:",
+              [...normalizedEnabled],
+            );
+            setEnabledCredentials(normalizedEnabled);
+            localStorage.setItem(
+              "enabledCredentials",
+              JSON.stringify([...normalizedEnabled]),
+            );
+          }
         }
       } catch (error) {
         console.error("[CredentialsTab] Error loading credentials:", error);
@@ -211,7 +277,7 @@ const CredentialsTab = ({
     [
       config,
       credentialsFolderPath,
-      enabledCredentials.size,
+      enabledCredentials,
       setEnabledCredentials,
       setRawCredentials,
       toast,
@@ -445,14 +511,18 @@ const CredentialsTab = ({
 
   // Toggle a credential on/off
   const handleToggleCredential = useCallback(
-    (key: string) => {
-      const newEnabled = new Set(enabledCredentials);
-      if (newEnabled.has(key)) {
-        console.log(`[CredentialsTab] Disabling credential: ${key}`);
-        newEnabled.delete(key);
+    (entry: CredentialEntry) => {
+      const credentialId = getCredentialIdentity(entry);
+      const newEnabled = normalizeEnabledCredentialsForEntries(
+        enabledCredentials,
+        entries,
+      );
+      if (newEnabled.has(credentialId)) {
+        console.log(`[CredentialsTab] Disabling credential: ${credentialId}`);
+        newEnabled.delete(credentialId);
       } else {
-        console.log(`[CredentialsTab] Enabling credential: ${key}`);
-        newEnabled.add(key);
+        console.log(`[CredentialsTab] Enabling credential: ${credentialId}`);
+        newEnabled.add(credentialId);
       }
       setEnabledCredentials(newEnabled);
       localStorage.setItem(
@@ -490,18 +560,25 @@ const CredentialsTab = ({
       };
       void persistEnabledState();
     },
-    [config, credentialsFolderPath, enabledCredentials, setEnabledCredentials],
+    [
+      config,
+      credentialsFolderPath,
+      enabledCredentials,
+      entries,
+      setEnabledCredentials,
+    ],
   );
 
   // Refresh a credential's token
   const handleRefreshToken = useCallback(
-    async (credentialKey: string, sourceFile: string) => {
+    async (entry: CredentialEntry) => {
       if (!credentialsFolderPath) return;
 
+      const credentialId = getCredentialIdentity(entry);
       console.log(
-        `[CredentialsTab] Refreshing token for: ${credentialKey} in file: ${sourceFile}`,
+        `[CredentialsTab] Refreshing token for: ${entry.key} in file: ${entry.sourceFile}`,
       );
-      setRefreshingKey(credentialKey);
+      setRefreshingKey(credentialId);
 
       try {
         const baseUrl = getMCPProxyAddress(config);
@@ -514,8 +591,8 @@ const CredentialsTab = ({
           },
           body: JSON.stringify({
             folderPath: credentialsFolderPath,
-            sourceFile,
-            credentialKey,
+            sourceFile: entry.sourceFile,
+            credentialKey: entry.key,
           }),
         });
 
@@ -536,7 +613,7 @@ const CredentialsTab = ({
 
         toast({
           title: "Token Refreshed",
-          description: `Token for ${credentialKey.split("|")[0]} refreshed. Expires in ${formatDuration(data.expiresInMs)}`,
+          description: `Token for ${entry.serverName} refreshed. Expires in ${formatDuration(data.expiresInMs)}`,
         });
 
         // Reload credentials to get updated data
@@ -569,7 +646,10 @@ const CredentialsTab = ({
 
       console.log(`[CredentialsTab] Testing connection to: ${entry.serverUrl}`);
 
-      let accessToken = rawCredentials?.[entry.key]?.access_token;
+      let accessToken = getCredentialRecord(
+        rawCredentials,
+        entry,
+      )?.access_token;
 
       // Check if token is expired and auto-refresh if possible
       if (
@@ -758,14 +838,29 @@ const CredentialsTab = ({
             : entry,
         ),
       );
-      if (rawCredentials?.[editingEntry.key]) {
-        setRawCredentials({
+      const editingCredentialId = getCredentialIdentity(editingEntry);
+      const editingCredential = getCredentialRecord(
+        rawCredentials,
+        editingEntry,
+      );
+      if (rawCredentials && editingCredential) {
+        const nextRawCredentials = {
           ...rawCredentials,
-          [editingEntry.key]: {
-            ...rawCredentials[editingEntry.key],
+          [editingCredentialId]: {
+            ...editingCredential,
             server_name: nextServerName,
           },
-        });
+        };
+        if (
+          rawCredentials[editingEntry.key]?._sourceFile ===
+          editingEntry.sourceFile
+        ) {
+          nextRawCredentials[editingEntry.key] = {
+            ...rawCredentials[editingEntry.key],
+            server_name: nextServerName,
+          };
+        }
+        setRawCredentials(nextRawCredentials);
       }
 
       toast({
@@ -984,13 +1079,20 @@ const CredentialsTab = ({
 
                 {/* Entries for this file */}
                 {fileEntries.map((entry) => {
-                  const isEnabled = enabledCredentials.has(entry.key);
+                  const credentialId = getCredentialIdentity(entry);
+                  const credentialRecord = getCredentialRecord(
+                    rawCredentials,
+                    entry,
+                  );
+                  const isEnabled =
+                    enabledCredentials.has(credentialId) ||
+                    enabledCredentials.has(entry.key);
                   const expiryStatus = getExpiryStatus(entry);
-                  const isRefreshing = refreshingKey === entry.key;
+                  const isRefreshing = refreshingKey === credentialId;
 
                   return (
                     <Card
-                      key={entry.key}
+                      key={credentialId}
                       className={`transition-all duration-200 ${
                         !isEnabled ? "opacity-50 bg-muted/30" : ""
                       }`}
@@ -1039,12 +1141,7 @@ const CredentialsTab = ({
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() =>
-                                  handleRefreshToken(
-                                    entry.key,
-                                    entry.sourceFile,
-                                  )
-                                }
+                                onClick={() => handleRefreshToken(entry)}
                                 disabled={isRefreshing || !isEnabled}
                                 title="Refresh token"
                               >
@@ -1059,7 +1156,7 @@ const CredentialsTab = ({
                             <Switch
                               checked={isEnabled}
                               onCheckedChange={() =>
-                                handleToggleCredential(entry.key)
+                                handleToggleCredential(entry)
                               }
                             />
                           </div>
@@ -1118,16 +1215,14 @@ const CredentialsTab = ({
                                       Access Token
                                     </p>
                                     {entry.hasAccessToken &&
-                                      rawCredentials?.[entry.key]
-                                        ?.access_token && (
+                                      credentialRecord?.access_token && (
                                         <Button
                                           variant="ghost"
                                           size="sm"
                                           className="h-6 px-2 text-xs"
                                           onClick={() => {
                                             navigator.clipboard.writeText(
-                                              rawCredentials[entry.key]
-                                                .access_token,
+                                              credentialRecord.access_token,
                                             );
                                             toast({
                                               title: "Copied",
@@ -1143,8 +1238,8 @@ const CredentialsTab = ({
                                   </div>
                                   {entry.hasAccessToken ? (
                                     <p className="text-sm font-mono bg-muted px-3 py-1.5 rounded break-all max-h-20 overflow-auto">
-                                      {rawCredentials?.[entry.key]?.access_token
-                                        ? `${rawCredentials[entry.key].access_token.substring(0, 50)}...`
+                                      {credentialRecord?.access_token
+                                        ? `${credentialRecord.access_token.substring(0, 50)}...`
                                         : "Available"}
                                     </p>
                                   ) : (
@@ -1161,16 +1256,14 @@ const CredentialsTab = ({
                                       <p className="text-xs font-medium text-muted-foreground">
                                         Refresh Token
                                       </p>
-                                      {rawCredentials?.[entry.key]
-                                        ?.refresh_token && (
+                                      {credentialRecord?.refresh_token && (
                                         <Button
                                           variant="ghost"
                                           size="sm"
                                           className="h-6 px-2 text-xs"
                                           onClick={() => {
                                             navigator.clipboard.writeText(
-                                              rawCredentials[entry.key]
-                                                .refresh_token,
+                                              credentialRecord.refresh_token,
                                             );
                                             toast({
                                               title: "Copied",
@@ -1185,9 +1278,8 @@ const CredentialsTab = ({
                                       )}
                                     </div>
                                     <p className="text-sm font-mono bg-muted px-3 py-1.5 rounded break-all max-h-20 overflow-auto">
-                                      {rawCredentials?.[entry.key]
-                                        ?.refresh_token
-                                        ? `${rawCredentials[entry.key].refresh_token.substring(0, 50)}...`
+                                      {credentialRecord?.refresh_token
+                                        ? `${credentialRecord.refresh_token.substring(0, 50)}...`
                                         : "Available"}
                                     </p>
                                   </div>

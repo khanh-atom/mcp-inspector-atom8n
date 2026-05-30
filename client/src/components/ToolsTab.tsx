@@ -390,7 +390,7 @@ const ToolsTab = ({
           requestBody.credentialMeta = {
             folderPath: effectiveCredentialsFolderPath,
             sourceFile: matchingCredential._sourceFile || "credentials.json",
-            credentialKey: matchingKey,
+            credentialKey: matchingCredential._credentialKey || matchingKey,
           };
         }
       }

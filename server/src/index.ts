@@ -1637,6 +1637,7 @@ interface CredentialRecord {
   refresh_token?: string;
   scopes?: string[];
   _sourceFile?: string;
+  _credentialKey?: string;
 }
 
 interface RefreshResult {
@@ -1828,6 +1829,29 @@ function normalizeServerUrl(value: unknown): string | null {
   }
 }
 
+const CREDENTIAL_ID_PREFIX = "credential:";
+
+function createCredentialIdentity(
+  sourceFile: string,
+  credentialKey: string,
+): string {
+  return `${CREDENTIAL_ID_PREFIX}${encodeURIComponent(sourceFile)}:${encodeURIComponent(credentialKey)}`;
+}
+
+function isCredentialAllowedByEnabledState(
+  allowedCredentialKeys: Set<string> | null,
+  sourceFile: string,
+  credentialKey: string,
+): boolean {
+  if (!allowedCredentialKeys) return true;
+  return (
+    allowedCredentialKeys.has(credentialKey) ||
+    allowedCredentialKeys.has(
+      createCredentialIdentity(sourceFile, credentialKey),
+    )
+  );
+}
+
 function getServerConfigUrl(
   serverConfig: Record<string, unknown>,
 ): string | null {
@@ -1917,8 +1941,11 @@ async function findCredentialForServerUrl(
 
       for (const [credentialKey, credential] of Object.entries(credentials)) {
         if (
-          allowedCredentialKeys &&
-          !allowedCredentialKeys.has(credentialKey)
+          !isCredentialAllowedByEnabledState(
+            allowedCredentialKeys,
+            sourceFile,
+            credentialKey,
+          )
         ) {
           logger.info(
             `[credentials:lookup] Skipping key '${credentialKey}' from ${sourceFile}: not enabled for this request`,
@@ -2924,6 +2951,7 @@ function parseCredentialFile(
   fileContent: string,
   fileName: string,
 ): Array<{
+  id: string;
   key: string;
   serverName: string;
   serverUrl: string;
@@ -2938,6 +2966,7 @@ function parseCredentialFile(
 }> {
   const parsed = JSON.parse(fileContent);
   return Object.entries(parsed).map(([key, value]: [string, any]) => ({
+    id: createCredentialIdentity(fileName, key),
     key,
     serverName: value.server_name || key.split("|")[0] || "unknown",
     serverUrl: value.server_url || "",
@@ -3030,10 +3059,16 @@ app.get(
 
           // Merge into combined credentials with source file tag
           for (const [key, value] of Object.entries(parsed)) {
-            allCredentials[key] = {
+            const credential = {
               ...(value as any),
               _sourceFile: fileName,
+              _credentialKey: key,
             };
+            allCredentials[createCredentialIdentity(fileName, key)] =
+              credential;
+            if (!allCredentials[key]) {
+              allCredentials[key] = credential;
+            }
           }
 
           files.push({ name: fileName, entryCount: entries.length });
