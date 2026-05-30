@@ -2616,6 +2616,7 @@ app.post(
         message: "Token refreshed successfully",
         credentialKey,
         sourceFile,
+        accessToken: cred.access_token,
         expiresAt: cred.expires_at,
         expiresInMs: cred.expires_at - Date.now(),
       });

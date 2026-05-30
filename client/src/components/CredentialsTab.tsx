@@ -509,9 +509,9 @@ const CredentialsTab = ({
     [config, credentialsFolderPath, loadCredentials, toast],
   );
 
-  // Test connection to a server — delegates to App's handleTestConnection
+  // Test connection to a server — auto-refreshes expired tokens, then delegates to App
   const handleTestConnection = useCallback(
-    (entry: CredentialEntry) => {
+    async (entry: CredentialEntry) => {
       if (!entry.serverUrl) {
         toast({
           title: "Cannot Test",
@@ -523,14 +523,99 @@ const CredentialsTab = ({
 
       console.log(`[CredentialsTab] Testing connection to: ${entry.serverUrl}`);
 
+      let accessToken = rawCredentials?.[entry.key]?.access_token;
+
+      // Check if token is expired and auto-refresh if possible
+      if (
+        entry.isExpired ||
+        (entry.expiresAt && entry.expiresAt <= Date.now())
+      ) {
+        console.log(
+          `[CredentialsTab] Token expired for ${entry.serverName}, attempting refresh...`,
+        );
+
+        if (!entry.hasRefreshToken) {
+          toast({
+            title: "Token Expired",
+            description: `Token for ${entry.serverName} is expired and no refresh token is available`,
+            variant: "destructive",
+          });
+          return;
+        }
+
+        if (!credentialsFolderPath) {
+          toast({
+            title: "Cannot Refresh",
+            description: "No credentials folder set",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        toast({
+          title: "Refreshing Token",
+          description: `Token for ${entry.serverName} is expired. Refreshing...`,
+        });
+
+        try {
+          const baseUrl = getMCPProxyAddress(config);
+          const { token, header } = getMCPProxyAuthToken(config);
+          const resp = await fetch(`${baseUrl}/credentials/refresh`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              [header]: token ? `Bearer ${token}` : "",
+            },
+            body: JSON.stringify({
+              folderPath: credentialsFolderPath,
+              sourceFile: entry.sourceFile,
+              credentialKey: entry.key,
+            }),
+          });
+
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            console.error("[CredentialsTab] Auto-refresh failed:", err);
+            toast({
+              title: "Refresh Failed",
+              description:
+                err.message || `Failed to refresh token (${resp.status})`,
+              variant: "destructive",
+            });
+            return;
+          }
+
+          const refreshData = await resp.json();
+          console.log(
+            `[CredentialsTab] Token refreshed, new expiry in ${formatDuration(refreshData.expiresInMs)}`,
+          );
+
+          // Use the new access token
+          accessToken = refreshData.accessToken;
+
+          // Reload credentials in background to update UI
+          loadCredentials();
+
+          toast({
+            title: "Token Refreshed",
+            description: `Token refreshed. Now connecting to ${entry.serverName}...`,
+          });
+        } catch (error) {
+          console.error("[CredentialsTab] Auto-refresh error:", error);
+          toast({
+            title: "Refresh Error",
+            description: `Failed to refresh token: ${error instanceof Error ? error.message : String(error)}`,
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
       if (onTestConnection) {
-        // Build a server config matching what App.handleTestConnection expects
-        // Include the stored access token so the connection is authenticated
-        const cred = rawCredentials?.[entry.key];
         onTestConnection({
           type: "streamable-http",
           url: entry.serverUrl,
-          bearerToken: cred?.access_token || undefined,
+          bearerToken: accessToken || undefined,
         });
       } else {
         toast({
@@ -539,7 +624,14 @@ const CredentialsTab = ({
         });
       }
     },
-    [onTestConnection, toast],
+    [
+      onTestConnection,
+      rawCredentials,
+      config,
+      credentialsFolderPath,
+      loadCredentials,
+      toast,
+    ],
   );
 
   // Compute expiry status for a credential
