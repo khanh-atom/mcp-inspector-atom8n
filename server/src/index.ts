@@ -1601,6 +1601,7 @@ app.post(
 async function createExecuteToolConnection(
   serverConfig: Record<string, unknown>,
   req: express.Request,
+  accessToken?: string,
 ): Promise<CachedExecuteToolConnection> {
   let transport: Transport;
   let headerHolder: { headers: HeadersInit } | undefined;
@@ -1614,6 +1615,13 @@ async function createExecuteToolConnection(
     }
     const headers = getHttpHeaders(req);
     headers["Accept"] = "text/event-stream, application/json";
+    // [CREDENTIALS] Inject credential access_token as Authorization header
+    if (accessToken) {
+      logger.info(
+        `[execute-tool:credentials] Injecting Authorization header for URL: ${url}`,
+      );
+      headers["Authorization"] = `Bearer ${accessToken}`;
+    }
     headerHolder = { headers };
     if (serverConfig.type === "sse") {
       transport = new SSEClientTransport(new URL(url), {
@@ -1653,7 +1661,22 @@ async function getOrCreateExecuteToolConnection(
   cacheKey: string,
   serverConfig: Record<string, unknown>,
   req: express.Request,
+  accessToken?: string,
 ): Promise<CachedExecuteToolConnection> {
+  // [CREDENTIALS] When an access token is provided, skip the cache to ensure fresh headers
+  if (accessToken) {
+    logger.info(
+      `[execute-tool:credentials] Bypassing cache for cacheKey='${cacheKey}' (credential token provided)`,
+    );
+    await evictExecuteToolConnection(cacheKey);
+    const conn = await createExecuteToolConnection(
+      serverConfig,
+      req,
+      accessToken,
+    );
+    executeToolConnectionCache.set(cacheKey, conn);
+    return conn;
+  }
   const entry = executeToolConnectionCache.get(cacheKey);
   if (entry && "client" in entry) return entry;
   if (entry instanceof Promise) {
@@ -1699,12 +1722,21 @@ app.post(
       server,
       toolName,
       toolArgs = {},
+      credentials,
     }: {
       serverName?: string;
       server?: Record<string, unknown>;
       toolName?: string;
       toolArgs?: Record<string, unknown>;
+      credentials?: { access_token?: string };
     } = req.body;
+
+    // [CREDENTIALS] Log if credentials are being provided
+    if (credentials?.access_token) {
+      logger.info(
+        `[execute-tool:credentials] Credentials provided for toolName=${toolName || "<missing>"}, token length=${credentials.access_token.length}`,
+      );
+    }
 
     logger.info(
       `[execute-tool] Request received toolName=${toolName || "<missing>"} serverName=${serverName || "<none>"} hasInlineServer=${Boolean(server)}`,
@@ -1767,10 +1799,12 @@ app.post(
         `[execute-tool] Executing tool '${toolName}' via cacheKey='${cacheKey}'`,
       );
 
+      // [CREDENTIALS] Pass credential access_token to inject into HTTP transport
       const { client } = await getOrCreateExecuteToolConnection(
         cacheKey,
         resolvedServerConfig,
         req,
+        credentials?.access_token,
       );
 
       try {
@@ -2252,6 +2286,423 @@ app.post(
     }
   },
 );
+// ── Credential Management Endpoints ────────────────────────────────────────
+
+// GET /credentials — Read a credentials JSON file from disk
+app.get(
+  "/credentials",
+  originValidationMiddleware,
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const rawPath = (req.query.path as string) || "";
+      if (!rawPath) {
+        logger.warn("[credentials:GET] Missing 'path' query parameter");
+        res.status(400).json({
+          error: "Bad Request",
+          message: "Missing 'path' query parameter",
+        });
+        return;
+      }
+
+      const filePath = expandTildePath(rawPath);
+      logger.info(`[credentials:GET] Reading credentials from: ${filePath}`);
+
+      try {
+        const fileContent = await fs.readFile(filePath, "utf8");
+        const credentials = JSON.parse(fileContent);
+
+        // Build a summary of credential entries
+        const entries = Object.entries(credentials).map(
+          ([key, value]: [string, any]) => ({
+            key,
+            serverName: value.server_name || key.split("|")[0] || "unknown",
+            serverUrl: value.server_url || "",
+            hasAccessToken: !!value.access_token,
+            hasRefreshToken: !!value.refresh_token,
+            expiresAt: value.expires_at || null,
+            isExpired: value.expires_at ? Date.now() > value.expires_at : false,
+            expiresInMs: value.expires_at
+              ? value.expires_at - Date.now()
+              : null,
+            scopes: value.scopes || [],
+            clientId: value.client_id || "",
+          }),
+        );
+
+        logger.info(
+          `[credentials:GET] Loaded ${entries.length} credential(s) from ${filePath}`,
+        );
+
+        res.json({
+          success: true,
+          path: filePath,
+          credentials,
+          entries,
+          count: entries.length,
+        });
+      } catch (readErr: any) {
+        if (readErr?.code === "ENOENT") {
+          logger.warn(
+            `[credentials:GET] Credentials file not found: ${filePath}`,
+          );
+          res.status(404).json({
+            error: "Not Found",
+            message: `Credentials file not found at ${filePath}`,
+          });
+          return;
+        }
+        logger.error(`[credentials:GET] Error reading file:`, readErr);
+        res.status(500).json({
+          error: "Internal Server Error",
+          message: readErr?.message || String(readErr),
+        });
+      }
+    } catch (error: any) {
+      logger.error(`[credentials:GET] Unhandled error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// PUT /credentials — Write updated credentials back to disk
+app.put(
+  "/credentials",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { path: rawPath, credentials } = req.body;
+      if (!rawPath || !credentials) {
+        logger.warn(
+          "[credentials:PUT] Missing 'path' or 'credentials' in body",
+        );
+        res.status(400).json({
+          error: "Bad Request",
+          message: "Both 'path' and 'credentials' are required",
+        });
+        return;
+      }
+
+      const filePath = expandTildePath(rawPath);
+      logger.info(`[credentials:PUT] Writing credentials to: ${filePath}`);
+
+      await fs.writeFile(
+        filePath,
+        JSON.stringify(credentials, null, 4),
+        "utf8",
+      );
+
+      logger.info(
+        `[credentials:PUT] Credentials written successfully to: ${filePath}`,
+      );
+      res.json({
+        success: true,
+        message: "Credentials saved successfully",
+        path: filePath,
+      });
+    } catch (error: any) {
+      logger.error(`[credentials:PUT] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// POST /credentials/refresh — Refresh an expired OAuth token
+app.post(
+  "/credentials/refresh",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { path: rawPath, credentialKey } = req.body;
+      if (!rawPath || !credentialKey) {
+        logger.warn(
+          "[credentials:refresh] Missing 'path' or 'credentialKey' in body",
+        );
+        res.status(400).json({
+          error: "Bad Request",
+          message: "Both 'path' and 'credentialKey' are required",
+        });
+        return;
+      }
+
+      const filePath = expandTildePath(rawPath);
+      logger.info(
+        `[credentials:refresh] Refreshing token for key '${credentialKey}' in ${filePath}`,
+      );
+
+      // Read current credentials
+      let credentials: Record<string, any>;
+      try {
+        const fileContent = await fs.readFile(filePath, "utf8");
+        credentials = JSON.parse(fileContent);
+      } catch (readErr: any) {
+        logger.error(
+          `[credentials:refresh] Failed to read credentials file:`,
+          readErr,
+        );
+        res.status(404).json({
+          error: "Not Found",
+          message: `Credentials file not found or invalid: ${filePath}`,
+        });
+        return;
+      }
+
+      const cred = credentials[credentialKey];
+      if (!cred) {
+        logger.warn(
+          `[credentials:refresh] Credential key '${credentialKey}' not found in file`,
+        );
+        res.status(404).json({
+          error: "Not Found",
+          message: `Credential key '${credentialKey}' not found`,
+        });
+        return;
+      }
+
+      if (!cred.refresh_token || !cred.client_id || !cred.server_url) {
+        logger.warn(
+          `[credentials:refresh] Credential '${credentialKey}' missing required fields for refresh`,
+        );
+        res.status(400).json({
+          error: "Bad Request",
+          message: "Credential missing refresh_token, client_id, or server_url",
+        });
+        return;
+      }
+
+      // Derive token endpoint from server URL (e.g., mcp.us3.datadoghq.com → api.us3.datadoghq.com)
+      const serverUrl = new URL(cred.server_url);
+      const apiHost = serverUrl.hostname.replace(/^mcp\./, "api.");
+      const tokenUrl = `https://${apiHost}/oauth2/v1/token`;
+
+      logger.info(
+        `[credentials:refresh] Token refresh URL: ${tokenUrl} for server: ${cred.server_name || credentialKey}`,
+      );
+
+      const body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: cred.refresh_token,
+        client_id: cred.client_id,
+      });
+
+      const tokenResp = await fetch(tokenUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+      });
+
+      if (!tokenResp.ok) {
+        const text = await tokenResp.text();
+        logger.error(
+          `[credentials:refresh] Token refresh failed (${tokenResp.status}): ${text}`,
+        );
+        res.status(tokenResp.status).json({
+          error: "Token Refresh Failed",
+          message: `Token refresh failed (${tokenResp.status}): ${text}`,
+        });
+        return;
+      }
+
+      const data = (await tokenResp.json()) as any;
+
+      // Update credential in memory
+      cred.access_token = data.access_token;
+      cred.refresh_token = data.refresh_token ?? cred.refresh_token;
+      cred.expires_at = Date.now() + (data.expires_in ?? 3600) * 1000;
+      credentials[credentialKey] = cred;
+
+      // Write back to disk
+      await fs.writeFile(
+        filePath,
+        JSON.stringify(credentials, null, 4),
+        "utf8",
+      );
+
+      logger.info(
+        `[credentials:refresh] Token refreshed & saved for '${credentialKey}'. New expiry: ${new Date(cred.expires_at).toISOString()}`,
+      );
+
+      res.json({
+        success: true,
+        message: "Token refreshed successfully",
+        credentialKey,
+        expiresAt: cred.expires_at,
+        expiresInMs: cred.expires_at - Date.now(),
+      });
+    } catch (error: any) {
+      logger.error(`[credentials:refresh] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// POST /credentials/choose-file — Open native file picker for credentials files
+app.post(
+  "/credentials/choose-file",
+  originValidationMiddleware,
+  authMiddleware,
+  (req, res) => {
+    try {
+      const platform = process.platform;
+      let command: string;
+
+      if (platform === "darwin") {
+        command = `osascript -e 'POSIX path of (choose file of type {"public.json"} with prompt "Select credentials file")'`;
+      } else if (platform === "win32") {
+        command = `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'JSON files (*.json)|*.json'; $f.Title = 'Select credentials file'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }"`;
+      } else {
+        command = `zenity --file-selection --title="Select credentials file" --file-filter="JSON files | *.json"`;
+      }
+
+      logger.info(`[credentials:choose-file] Opening file picker`);
+
+      exec(command, (error: any, stdout: string, stderr: string) => {
+        if (error) {
+          if (error.code === 1 || stderr.includes("User canceled")) {
+            logger.info(`[credentials:choose-file] User cancelled file picker`);
+            res.json({ cancelled: true });
+            return;
+          }
+          logger.error(`[credentials:choose-file] Error: ${error.message}`);
+          res.status(500).json({
+            error: "Internal Server Error",
+            message: error.message,
+          });
+          return;
+        }
+
+        const filePath = stdout.trim();
+        if (!filePath) {
+          logger.info(`[credentials:choose-file] No file selected`);
+          res.json({ cancelled: true });
+          return;
+        }
+
+        // Convert absolute path to tilde path for consistency
+        const homeDir = os.homedir();
+        const tildePath = filePath.startsWith(homeDir)
+          ? "~/" + filePath.slice(homeDir.length + 1).replace(/\\/g, "/")
+          : filePath;
+
+        logger.info(
+          `[credentials:choose-file] File chosen: ${filePath} (tilde: ${tildePath})`,
+        );
+        res.json({ path: tildePath, absolutePath: filePath });
+      });
+    } catch (error: any) {
+      logger.error(
+        `[credentials:choose-file] Error: ${error?.message || String(error)}`,
+      );
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// POST /credentials/upload — Handle drag-and-drop file content upload
+app.post(
+  "/credentials/upload",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json({ limit: "5mb" }),
+  async (req, res) => {
+    try {
+      const { content, fileName, savePath } = req.body;
+      if (!content) {
+        logger.warn("[credentials:upload] Missing 'content' in body");
+        res.status(400).json({
+          error: "Bad Request",
+          message: "Missing 'content' in request body",
+        });
+        return;
+      }
+
+      // Validate JSON
+      let parsed: Record<string, any>;
+      try {
+        parsed = typeof content === "string" ? JSON.parse(content) : content;
+      } catch {
+        logger.warn("[credentials:upload] Invalid JSON content");
+        res.status(400).json({
+          error: "Bad Request",
+          message: "File content is not valid JSON",
+        });
+        return;
+      }
+
+      // Determine save path: use provided path, or default to ~/.credentials.json
+      const defaultPath = path.join(
+        os.homedir(),
+        fileName || ".credentials.json",
+      );
+      const targetPath = savePath ? expandTildePath(savePath) : defaultPath;
+
+      logger.info(
+        `[credentials:upload] Saving dropped file to: ${targetPath} (fileName: ${fileName || "<none>"})`,
+      );
+
+      // Write the file
+      await fs.writeFile(targetPath, JSON.stringify(parsed, null, 4), "utf8");
+
+      // Convert to tilde path for UI display
+      const homeDir = os.homedir();
+      const tildePath = targetPath.startsWith(homeDir)
+        ? "~/" + targetPath.slice(homeDir.length + 1).replace(/\\/g, "/")
+        : targetPath;
+
+      // Build entries summary (same logic as GET /credentials)
+      const entries = Object.entries(parsed).map(
+        ([key, value]: [string, any]) => ({
+          key,
+          serverName: value.server_name || key.split("|")[0] || "unknown",
+          serverUrl: value.server_url || "",
+          hasAccessToken: !!value.access_token,
+          hasRefreshToken: !!value.refresh_token,
+          expiresAt: value.expires_at || null,
+          isExpired: value.expires_at ? Date.now() > value.expires_at : false,
+          expiresInMs: value.expires_at ? value.expires_at - Date.now() : null,
+          scopes: value.scopes || [],
+          clientId: value.client_id || "",
+        }),
+      );
+
+      logger.info(
+        `[credentials:upload] Saved ${entries.length} credential(s) to ${tildePath}`,
+      );
+
+      res.json({
+        success: true,
+        path: tildePath,
+        absolutePath: targetPath,
+        credentials: parsed,
+        entries,
+        count: entries.length,
+      });
+    } catch (error: any) {
+      logger.error(`[credentials:upload] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
 const PORT = parseInt(
   process.env.SERVER_PORT || DEFAULT_MCP_PROXY_LISTEN_PORT,
   10,

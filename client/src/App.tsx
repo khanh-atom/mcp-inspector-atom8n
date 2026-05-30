@@ -54,6 +54,7 @@ import {
   Store,
   PanelLeftClose,
   PanelLeft,
+  Shield,
 } from "lucide-react";
 
 import { z } from "zod";
@@ -68,6 +69,7 @@ import {
   DialogClose,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import AuthDebugger from "./components/AuthDebugger";
 import ConsoleTab from "./components/ConsoleTab";
 import HistoryAndNotifications from "./components/HistoryAndNotifications";
@@ -94,6 +96,8 @@ import ElicitationTab, {
   ElicitationResponse,
 } from "./components/ElicitationTab";
 import MCPStoreTab from "./components/MCPStoreTab";
+import CredentialsTab from "./components/CredentialsTab";
+import type { RawCredentials } from "./components/CredentialsTab";
 import LoggerTab from "./components/LoggerTab";
 import {
   CustomHeaders,
@@ -234,6 +238,26 @@ const App = () => {
     localStorage.setItem("sidebarCollapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
   const [configRefreshKey, setConfigRefreshKey] = useState(0);
+  // [CREDENTIALS] State for credential management
+  const [credentialsFilePath, setCredentialsFilePath] = useState<string>(
+    () => localStorage.getItem("credentialsFilePath") || "",
+  );
+  const [enabledCredentials, setEnabledCredentials] = useState<Set<string>>(
+    () => {
+      const saved = localStorage.getItem("enabledCredentials");
+      if (saved) {
+        try {
+          return new Set(JSON.parse(saved) as string[]);
+        } catch {
+          return new Set<string>();
+        }
+      }
+      return new Set<string>();
+    },
+  );
+  const [rawCredentials, setRawCredentials] = useState<RawCredentials | null>(
+    null,
+  );
   const [crashError, setCrashError] = useState<string | null>(null);
   // [FORK] State for showing the "switch to fork" dialog when n8n tool call fails
   const [showForkDialog, setShowForkDialog] = useState(false);
@@ -710,6 +734,7 @@ const App = () => {
         "elicitations",
         "roots",
         "auth",
+        "credentials",
         "store",
       ];
 
@@ -1582,6 +1607,18 @@ const App = () => {
                     <Store className="w-4 h-4 mr-2" />
                     MCP Store
                   </TabsTrigger>
+                  <TabsTrigger value="credentials">
+                    <Shield className="w-4 h-4 mr-2" />
+                    Credentials
+                    {enabledCredentials.size > 0 && (
+                      <Badge
+                        variant="secondary"
+                        className="ml-1.5 text-xs px-1.5 py-0"
+                      >
+                        {enabledCredentials.size}
+                      </Badge>
+                    )}
+                  </TabsTrigger>
                   <TabsTrigger
                     value="resources"
                     disabled={!serverCapabilities?.resources}
@@ -1796,6 +1833,17 @@ const App = () => {
                         onRootsChange={handleRootsChange}
                       />
                       <AuthDebuggerWrapper />
+                      <TabsContent value="credentials">
+                        <CredentialsTab
+                          config={config}
+                          credentialsFilePath={credentialsFilePath}
+                          setCredentialsFilePath={setCredentialsFilePath}
+                          enabledCredentials={enabledCredentials}
+                          setEnabledCredentials={setEnabledCredentials}
+                          rawCredentials={rawCredentials}
+                          setRawCredentials={setRawCredentials}
+                        />
+                      </TabsContent>
                       <TabsContent value="store">
                         <MCPStoreTab
                           config={config}
@@ -1834,11 +1882,34 @@ const App = () => {
                     <Store className="w-4 h-4 mr-2" />
                     MCP Store
                   </TabsTrigger>
+                  <TabsTrigger value="credentials">
+                    <Shield className="w-4 h-4 mr-2" />
+                    Credentials
+                    {enabledCredentials.size > 0 && (
+                      <Badge
+                        variant="secondary"
+                        className="ml-1.5 text-xs px-1.5 py-0"
+                      >
+                        {enabledCredentials.size}
+                      </Badge>
+                    )}
+                  </TabsTrigger>
                   <TabsTrigger value="logger">
                     <FileText className="w-4 h-4 mr-2" />
                     Logger
                   </TabsTrigger>
                 </TabsList>
+                <TabsContent value="credentials">
+                  <CredentialsTab
+                    config={config}
+                    credentialsFilePath={credentialsFilePath}
+                    setCredentialsFilePath={setCredentialsFilePath}
+                    enabledCredentials={enabledCredentials}
+                    setEnabledCredentials={setEnabledCredentials}
+                    rawCredentials={rawCredentials}
+                    setRawCredentials={setRawCredentials}
+                  />
+                </TabsContent>
                 <TabsContent value="store">
                   <MCPStoreTab
                     config={config}
@@ -1857,29 +1928,31 @@ const App = () => {
               </Tabs>
             )}
           </div>
-          {activeTab !== "store" && activeTab !== "logger" && (
-            <div
-              className="relative border-t border-border"
-              style={{
-                height: `${historyPaneHeight}px`,
-              }}
-            >
+          {activeTab !== "credentials" &&
+            activeTab !== "store" &&
+            activeTab !== "logger" && (
               <div
-                className="absolute w-full h-4 -top-2 cursor-row-resize flex items-center justify-center hover:bg-accent/50 dark:hover:bg-input/40"
-                onMouseDown={handleDragStart}
+                className="relative border-t border-border"
+                style={{
+                  height: `${historyPaneHeight}px`,
+                }}
               >
-                <div className="w-8 h-1 rounded-full bg-border" />
+                <div
+                  className="absolute w-full h-4 -top-2 cursor-row-resize flex items-center justify-center hover:bg-accent/50 dark:hover:bg-input/40"
+                  onMouseDown={handleDragStart}
+                >
+                  <div className="w-8 h-1 rounded-full bg-border" />
+                </div>
+                <div className="h-full overflow-auto">
+                  <HistoryAndNotifications
+                    requestHistory={requestHistory}
+                    serverNotifications={notifications}
+                    onClearHistory={clearRequestHistory}
+                    onClearNotifications={handleClearNotifications}
+                  />
+                </div>
               </div>
-              <div className="h-full overflow-auto">
-                <HistoryAndNotifications
-                  requestHistory={requestHistory}
-                  serverNotifications={notifications}
-                  onClearHistory={clearRequestHistory}
-                  onClearNotifications={handleClearNotifications}
-                />
-              </div>
-            </div>
-          )}
+            )}
         </div>
       </div>
       <Dialog
