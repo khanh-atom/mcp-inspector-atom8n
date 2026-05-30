@@ -26,6 +26,7 @@ import express from "express";
 import path from "node:path";
 import os from "node:os";
 import { promises as fs } from "node:fs";
+import fsSync from "node:fs";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const TOML = require("@iarna/toml") as typeof import("@iarna/toml");
@@ -139,17 +140,23 @@ const updateHeadersInPlace = (
   currentHeaders: Record<string, string>,
   newHeaders: Record<string, string>,
 ) => {
-  // Preserve the Accept header, which is set at transport creation and
-  // is not present in subsequent client requests.
+  // Preserve headers that are set at transport creation and
+  // are not present in subsequent client requests.
   const accept = currentHeaders["Accept"];
+  // [PROXY] Preserve the Authorization header injected by the proxy for
+  // credential-authenticated upstream servers — client requests don't carry it.
+  const authorization = currentHeaders["Authorization"];
 
   // Clear the old headers and apply the new ones.
   Object.keys(currentHeaders).forEach((key) => delete currentHeaders[key]);
   Object.assign(currentHeaders, newHeaders);
 
-  // Restore the Accept header.
-  if (accept) {
+  // Restore preserved headers (only if the new headers don't already set them).
+  if (accept && !currentHeaders["Accept"]) {
     currentHeaders["Accept"] = accept;
+  }
+  if (authorization && !currentHeaders["Authorization"]) {
+    currentHeaders["Authorization"] = authorization;
   }
 };
 
@@ -478,14 +485,16 @@ const createTransport = async (
       const credentialKey = query.credentialKey as string | undefined;
 
       // [PROXY] Prefer direct credential lookup by identity (from Install)
+      let credentialInjected = false;
       if (credentialFile && credentialKey) {
+        const effectiveFolder = getEffectiveCredentialsFolderPath();
         const meta: CredentialMeta = {
-          folderPath: activeCredentialsFolderPath || DEFAULT_CREDENTIALS_FOLDER,
+          folderPath: effectiveFolder,
           sourceFile: credentialFile,
           credentialKey: credentialKey,
         };
         console.log(
-          `[createTransport:proxy] Direct credential lookup: ${credentialFile}/${credentialKey}`,
+          `[createTransport:proxy] Direct credential lookup: ${credentialFile}/${credentialKey} in folder: ${effectiveFolder}`,
         );
         try {
           const located = await readCredentialByMeta(meta);
@@ -516,16 +525,19 @@ const createTransport = async (
               "[createTransport:proxy] Injected token from direct credential lookup",
             );
           }
+          credentialInjected = true;
         } catch (error) {
           console.warn(
-            "[createTransport:proxy] Direct credential lookup failed:",
+            "[createTransport:proxy] Direct credential lookup failed, will try URL search:",
             error,
           );
         }
-      } else {
-        // [PROXY] Fallback: search by upstream URL
+      }
+
+      // [PROXY] Fallback: search by upstream URL if direct lookup wasn't available or failed
+      if (!credentialInjected) {
         console.log(
-          `[createTransport:proxy] No credential identity in query, searching by URL: ${upstreamUrl}`,
+          `[createTransport:proxy] Searching credential by upstream URL: ${upstreamUrl}`,
         );
         try {
           const located = await findCredentialForServerUrl(upstreamUrl);
@@ -1711,8 +1723,31 @@ app.post(
 // Extracted from /credentials/refresh so it can be reused by /execute-tool.
 const DEFAULT_CREDENTIALS_FOLDER = "./data";
 const CREDENTIALS_STATE_FILE = "state.json";
-let activeCredentialsFolderPath =
-  process.env.MCP_CREDENTIALS_FOLDER || DEFAULT_CREDENTIALS_FOLDER;
+const CREDENTIALS_FOLDER_PERSIST_FILE = path.join(
+  os.homedir(),
+  ".mcp-inspector",
+  "active_credentials_folder.txt",
+);
+
+// [PROXY] Read persisted credentials folder path on startup
+function readPersistedCredentialsFolder(): string {
+  try {
+    const persisted = fsSync
+      .readFileSync(CREDENTIALS_FOLDER_PERSIST_FILE, "utf8")
+      .trim();
+    if (persisted) {
+      console.log(
+        `[credentials:persist] Loaded persisted credentials folder: ${persisted}`,
+      );
+      return persisted;
+    }
+  } catch {
+    // File doesn't exist yet — that's fine
+  }
+  return process.env.MCP_CREDENTIALS_FOLDER || DEFAULT_CREDENTIALS_FOLDER;
+}
+
+let activeCredentialsFolderPath = readPersistedCredentialsFolder();
 
 function setActiveCredentialsFolderPath(rawPath: string, reason: string): void {
   if (!rawPath) return;
@@ -1720,6 +1755,21 @@ function setActiveCredentialsFolderPath(rawPath: string, reason: string): void {
   logger.info(
     `[credentials:active] Active credentials folder set to ${rawPath} (${reason})`,
   );
+  // [PROXY] Persist so it survives server restarts
+  try {
+    fsSync.mkdirSync(path.dirname(CREDENTIALS_FOLDER_PERSIST_FILE), {
+      recursive: true,
+    });
+    fsSync.writeFileSync(CREDENTIALS_FOLDER_PERSIST_FILE, rawPath, "utf8");
+    console.log(
+      `[credentials:persist] Persisted credentials folder: ${rawPath}`,
+    );
+  } catch (err) {
+    console.warn(
+      "[credentials:persist] Failed to persist credentials folder:",
+      err,
+    );
+  }
 }
 
 function getEffectiveCredentialsFolderPath(folderPath?: string): string {
