@@ -11,6 +11,11 @@ import {
 } from "@/components/ui/card";
 import { TabsContent } from "@/components/ui/tabs";
 import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
   Shield,
   Upload,
   RefreshCw,
@@ -24,6 +29,7 @@ import {
   Key,
   Globe,
   FileText,
+  Copy,
 } from "lucide-react";
 import { useToast } from "../lib/hooks/useToast";
 import { InspectorConfig } from "@/lib/configurationTypes";
@@ -760,29 +766,110 @@ const CredentialsTab = ({
                             variant={
                               entry.hasAccessToken ? "default" : "destructive"
                             }
-                            className="text-xs"
+                            className={`text-xs ${entry.hasAccessToken ? "cursor-pointer hover:opacity-80" : ""}`}
+                            onClick={() => {
+                              if (!entry.hasAccessToken || !rawCredentials)
+                                return;
+                              const cred = rawCredentials[entry.key];
+                              if (cred?.access_token) {
+                                navigator.clipboard.writeText(
+                                  cred.access_token,
+                                );
+                                toast({
+                                  title: "Copied",
+                                  description:
+                                    "Access token copied to clipboard",
+                                });
+                              }
+                            }}
+                            title={
+                              entry.hasAccessToken
+                                ? "Click to copy access token"
+                                : undefined
+                            }
                           >
-                            <Key className="w-3 h-3 mr-1" />
+                            {entry.hasAccessToken ? (
+                              <Copy className="w-3 h-3 mr-1" />
+                            ) : (
+                              <Key className="w-3 h-3 mr-1" />
+                            )}
                             {entry.hasAccessToken
                               ? "Access Token"
                               : "No Access Token"}
                           </Badge>
                           {entry.hasRefreshToken && (
-                            <Badge variant="outline" className="text-xs">
-                              <RefreshCw className="w-3 h-3 mr-1" />
+                            <Badge
+                              variant="outline"
+                              className="text-xs cursor-pointer hover:opacity-80"
+                              onClick={() => {
+                                if (!rawCredentials) return;
+                                const cred = rawCredentials[entry.key];
+                                if (cred?.refresh_token) {
+                                  navigator.clipboard.writeText(
+                                    cred.refresh_token,
+                                  );
+                                  toast({
+                                    title: "Copied",
+                                    description:
+                                      "Refresh token copied to clipboard",
+                                  });
+                                }
+                              }}
+                              title="Click to copy refresh token"
+                            >
+                              <Copy className="w-3 h-3 mr-1" />
                               Refresh Token
                             </Badge>
                           )}
                           {entry.scopes.length > 0 && (
-                            <Badge variant="outline" className="text-xs">
-                              {entry.scopes.length} scopes
-                            </Badge>
+                            <Popover>
+                              <PopoverTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors cursor-pointer hover:opacity-80 text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                                  title="Click to view scopes"
+                                >
+                                  {entry.scopes.length} scopes
+                                </button>
+                              </PopoverTrigger>
+                              <PopoverContent
+                                className="w-80 max-h-64 overflow-auto p-3"
+                                align="start"
+                              >
+                                <div className="space-y-1.5">
+                                  <p className="text-xs font-medium text-muted-foreground mb-2">
+                                    {entry.scopes.length} scope(s) for{" "}
+                                    {entry.serverName}
+                                  </p>
+                                  <div className="flex flex-wrap gap-1">
+                                    {entry.scopes.map((scope) => (
+                                      <Badge
+                                        key={scope}
+                                        variant="secondary"
+                                        className="text-[10px] font-mono"
+                                      >
+                                        {scope}
+                                      </Badge>
+                                    ))}
+                                  </div>
+                                </div>
+                              </PopoverContent>
+                            </Popover>
                           )}
                           {entry.clientId && (
                             <Badge
                               variant="outline"
-                              className="text-xs font-mono"
+                              className="text-xs font-mono cursor-pointer hover:opacity-80"
+                              onClick={() => {
+                                navigator.clipboard.writeText(entry.clientId);
+                                toast({
+                                  title: "Copied",
+                                  description: "Client ID copied to clipboard",
+                                });
+                              }}
+                              title="Click to copy full Client ID"
                             >
+                              <Copy className="w-3 h-3 mr-1" />
                               {entry.clientId.substring(0, 20)}...
                             </Badge>
                           )}
