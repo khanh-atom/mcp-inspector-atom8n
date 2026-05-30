@@ -432,7 +432,52 @@ const createTransport = async (
   const query = req.query;
   logger.info("Query parameters:", JSON.stringify(query));
 
-  const transportType = query.transportType as string;
+  let transportType = query.transportType as string | undefined;
+
+  // [PROXY] When credentialFile+credentialKey are provided but url/transportType are not,
+  // derive the upstream URL from the credential's server_url and default to streamable-http.
+  if (!transportType && !query.url) {
+    const credentialFile = query.credentialFile as string | undefined;
+    const credentialKey = query.credentialKey as string | undefined;
+    if (credentialFile && credentialKey) {
+      const effectiveFolder = getEffectiveCredentialsFolderPath();
+      const meta: CredentialMeta = {
+        folderPath: effectiveFolder,
+        sourceFile: credentialFile,
+        credentialKey: credentialKey,
+      };
+      console.log(
+        `[createTransport:proxy] No url/transportType — deriving from credential: ${credentialFile}/${credentialKey}`,
+      );
+      try {
+        const located = await readCredentialByMeta(meta);
+        if (located.credential.server_url) {
+          (query as any).url = located.credential.server_url;
+          transportType = "streamable-http";
+          console.log(
+            `[createTransport:proxy] Derived url=${located.credential.server_url}, transportType=streamable-http`,
+          );
+        } else {
+          throw new Error(
+            `Credential '${credentialKey}' in ${credentialFile} has no server_url`,
+          );
+        }
+      } catch (error) {
+        console.error(
+          `[createTransport:proxy] Failed to derive url from credential:`,
+          error,
+        );
+        throw new Error(
+          `Cannot derive upstream URL from credential: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  if (!transportType) {
+    logger.error("No transport type specified");
+    throw new Error("No transport type specified");
+  }
 
   if (transportType === "stdio") {
     const command = (query.command as string).trim();

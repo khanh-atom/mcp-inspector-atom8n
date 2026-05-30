@@ -966,45 +966,9 @@ const CredentialsTab = ({
         // Include credential identity so the proxy can load the exact credential (no search needed).
         const proxyBaseUrl = getMCPProxyAddress(config);
         const proxyParams = new URLSearchParams({
-          url: entry.serverUrl,
-          transportType: "streamable-http",
           credentialFile: entry.sourceFile,
           credentialKey: entry.key,
         });
-
-        // [PROXY] Include allowed tools in proxy URL if a selection is persisted
-        try {
-          const { token: authToken, header: authHeader } =
-            getMCPProxyAuthToken(config);
-          const credentialId = getCredentialIdentity(entry);
-          const selResp = await fetch(
-            `${proxyBaseUrl}/proxy/tool-selection?credentialId=${encodeURIComponent(credentialId)}&folderPath=${encodeURIComponent(credentialsFolderPath || "./data")}`,
-            {
-              method: "GET",
-              headers: {
-                "Content-Type": "application/json",
-                [authHeader]: authToken ? `Bearer ${authToken}` : "",
-              },
-            },
-          );
-          if (selResp.ok) {
-            const selData = await selResp.json();
-            if (
-              Array.isArray(selData.selectedTools) &&
-              selData.selectedTools.length > 0
-            ) {
-              proxyParams.set("allowedTools", selData.selectedTools.join(","));
-              console.log(
-                `[CredentialsTab:proxy] Including ${selData.selectedTools.length} allowed tools in proxy URL`,
-              );
-            }
-          }
-        } catch (selErr) {
-          console.warn(
-            "[CredentialsTab:proxy] Could not load tool selection for install:",
-            selErr,
-          );
-        }
 
         const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
         // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
@@ -1401,18 +1365,10 @@ const CredentialsTab = ({
     // Include credential identity so the proxy can load the exact credential.
     const proxyBaseUrl = getMCPProxyAddress(config);
     const proxyParams = new URLSearchParams({
-      url: proxyEntry.serverUrl,
-      transportType: "streamable-http",
       credentialFile: proxyEntry.sourceFile,
       credentialKey: proxyEntry.key,
     });
-    // [PROXY] Include allowed tools in proxy URL if not all are selected
-    if (
-      proxySelectedTools.size > 0 &&
-      proxySelectedTools.size < proxyTools.length
-    ) {
-      proxyParams.set("allowedTools", [...proxySelectedTools].join(","));
-    }
+
     const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
     // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
     const isAntigravity =
