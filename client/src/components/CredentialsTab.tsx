@@ -971,6 +971,41 @@ const CredentialsTab = ({
           credentialFile: entry.sourceFile,
           credentialKey: entry.key,
         });
+
+        // [PROXY] Include allowed tools in proxy URL if a selection is persisted
+        try {
+          const { token: authToken, header: authHeader } =
+            getMCPProxyAuthToken(config);
+          const credentialId = getCredentialIdentity(entry);
+          const selResp = await fetch(
+            `${proxyBaseUrl}/proxy/tool-selection?credentialId=${encodeURIComponent(credentialId)}&folderPath=${encodeURIComponent(credentialsFolderPath || "./data")}`,
+            {
+              method: "GET",
+              headers: {
+                "Content-Type": "application/json",
+                [authHeader]: authToken ? `Bearer ${authToken}` : "",
+              },
+            },
+          );
+          if (selResp.ok) {
+            const selData = await selResp.json();
+            if (
+              Array.isArray(selData.selectedTools) &&
+              selData.selectedTools.length > 0
+            ) {
+              proxyParams.set("allowedTools", selData.selectedTools.join(","));
+              console.log(
+                `[CredentialsTab:proxy] Including ${selData.selectedTools.length} allowed tools in proxy URL`,
+              );
+            }
+          }
+        } catch (selErr) {
+          console.warn(
+            "[CredentialsTab:proxy] Could not load tool selection for install:",
+            selErr,
+          );
+        }
+
         const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
         // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
         const isAntigravity =
@@ -1048,6 +1083,7 @@ const CredentialsTab = ({
     [
       config,
       configFilePath,
+      credentialsFolderPath,
       currentServers,
       getProxyServerKey,
       onConfigFileUpdated,
@@ -1203,8 +1239,52 @@ const CredentialsTab = ({
         );
 
         setProxyTools(tools);
-        // All tools selected by default
-        setProxySelectedTools(new Set(tools.map((t) => t.name)));
+
+        // [PROXY] Load persisted tool selection from server
+        const credentialId = getCredentialIdentity(entry);
+        try {
+          const selResp = await fetch(
+            `${baseUrl}/proxy/tool-selection?credentialId=${encodeURIComponent(credentialId)}&folderPath=${encodeURIComponent(credentialsFolderPath || "./data")}`,
+            {
+              method: "GET",
+              headers: {
+                "Content-Type": "application/json",
+                [header]: token ? `Bearer ${token}` : "",
+              },
+            },
+          );
+          if (selResp.ok) {
+            const selData = await selResp.json();
+            if (Array.isArray(selData.selectedTools)) {
+              // Intersect persisted selection with available tools
+              const availableNames = new Set(tools.map((t) => t.name));
+              const persisted = new Set<string>(
+                (selData.selectedTools as string[]).filter((n: string) =>
+                  availableNames.has(n),
+                ),
+              );
+              console.log(
+                `[CredentialsTab:proxy] Restored persisted selection: ${persisted.size}/${tools.length} tool(s)`,
+              );
+              setProxySelectedTools(persisted);
+            } else {
+              // No persisted selection — default to all tools
+              console.log(
+                "[CredentialsTab:proxy] No persisted selection, defaulting to all tools",
+              );
+              setProxySelectedTools(new Set(tools.map((t) => t.name)));
+            }
+          } else {
+            // Fallback: select all tools
+            setProxySelectedTools(new Set(tools.map((t) => t.name)));
+          }
+        } catch (selError) {
+          console.warn(
+            "[CredentialsTab:proxy] Failed to load persisted tool selection, defaulting to all:",
+            selError,
+          );
+          setProxySelectedTools(new Set(tools.map((t) => t.name)));
+        }
       } catch (error) {
         console.error("[CredentialsTab:proxy] Error fetching tools:", error);
         toast({
@@ -1228,33 +1308,88 @@ const CredentialsTab = ({
     setProxySearchQuery("");
   }, []);
 
+  // [PROXY] Persist tool selection to server (fire-and-forget)
+  const persistProxyToolSelection = useCallback(
+    (credentialId: string, selectedTools: Set<string>) => {
+      const baseUrl = getMCPProxyAddress(config);
+      const { token, header } = getMCPProxyAuthToken(config);
+
+      fetch(`${baseUrl}/proxy/tool-selection`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          [header]: token ? `Bearer ${token}` : "",
+        },
+        body: JSON.stringify({
+          credentialId,
+          selectedTools: [...selectedTools],
+          folderPath: credentialsFolderPath || "./data",
+        }),
+      })
+        .then((resp) => {
+          if (!resp.ok) {
+            console.warn(
+              "[CredentialsTab:proxy] Failed to persist tool selection:",
+              resp.status,
+            );
+          } else {
+            console.log(
+              `[CredentialsTab:proxy] Persisted tool selection for ${credentialId}: ${selectedTools.size} tool(s)`,
+            );
+          }
+        })
+        .catch((err) => {
+          console.warn(
+            "[CredentialsTab:proxy] Error persisting tool selection:",
+            err,
+          );
+        });
+    },
+    [config, credentialsFolderPath],
+  );
+
   // [PROXY] Toggle a tool in the proxy selection
-  const handleToggleProxyTool = useCallback((toolName: string) => {
-    setProxySelectedTools((prev) => {
-      const next = new Set(prev);
-      if (next.has(toolName)) {
-        next.delete(toolName);
-        console.log(`[CredentialsTab:proxy] Deselected tool: ${toolName}`);
-      } else {
-        next.add(toolName);
-        console.log(`[CredentialsTab:proxy] Selected tool: ${toolName}`);
-      }
-      return next;
-    });
-  }, []);
+  const handleToggleProxyTool = useCallback(
+    (toolName: string) => {
+      setProxySelectedTools((prev) => {
+        const next = new Set(prev);
+        if (next.has(toolName)) {
+          next.delete(toolName);
+          console.log(`[CredentialsTab:proxy] Deselected tool: ${toolName}`);
+        } else {
+          next.add(toolName);
+          console.log(`[CredentialsTab:proxy] Selected tool: ${toolName}`);
+        }
+        // Persist the updated selection
+        if (proxyEntry) {
+          const credentialId = getCredentialIdentity(proxyEntry);
+          persistProxyToolSelection(credentialId, next);
+        }
+        return next;
+      });
+    },
+    [proxyEntry, persistProxyToolSelection],
+  );
 
   // [PROXY] Select / deselect all tools
   const handleSelectAllProxyTools = useCallback(() => {
     const allNames = proxyTools.map((t) => t.name);
     const allSelected = allNames.every((n) => proxySelectedTools.has(n));
+    let nextSet: Set<string>;
     if (allSelected) {
       console.log("[CredentialsTab:proxy] Deselecting all tools");
-      setProxySelectedTools(new Set());
+      nextSet = new Set();
     } else {
       console.log("[CredentialsTab:proxy] Selecting all tools");
-      setProxySelectedTools(new Set(allNames));
+      nextSet = new Set(allNames);
     }
-  }, [proxyTools, proxySelectedTools]);
+    setProxySelectedTools(nextSet);
+    // Persist the updated selection
+    if (proxyEntry) {
+      const credentialId = getCredentialIdentity(proxyEntry);
+      persistProxyToolSelection(credentialId, nextSet);
+    }
+  }, [proxyTools, proxySelectedTools, proxyEntry, persistProxyToolSelection]);
 
   // [PROXY] Copy MCP server config JSON to clipboard
   const handleCopyProxyConfig = useCallback(() => {
@@ -1271,6 +1406,13 @@ const CredentialsTab = ({
       credentialFile: proxyEntry.sourceFile,
       credentialKey: proxyEntry.key,
     });
+    // [PROXY] Include allowed tools in proxy URL if not all are selected
+    if (
+      proxySelectedTools.size > 0 &&
+      proxySelectedTools.size < proxyTools.length
+    ) {
+      proxyParams.set("allowedTools", [...proxySelectedTools].join(","));
+    }
     const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
     // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
     const isAntigravity =
@@ -1298,7 +1440,15 @@ const CredentialsTab = ({
       title: "Copied",
       description: "MCP server config copied to clipboard",
     });
-  }, [proxyEntry, getProxyServerKey, config, toast]);
+  }, [
+    proxyEntry,
+    getProxyServerKey,
+    config,
+    configFilePath,
+    proxySelectedTools,
+    proxyTools,
+    toast,
+  ]);
 
   // [PROXY] Copy curl command to clipboard
   const handleCopyCurl = useCallback(() => {

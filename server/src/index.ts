@@ -697,9 +697,22 @@ app.post(
 
         await webAppTransport.start();
 
+        // [PROXY] Parse allowed tools from query params (if set during Install)
+        const allowedToolsParam = req.query.allowedTools as string | undefined;
+        const allowedToolsSet = allowedToolsParam
+          ? new Set(allowedToolsParam.split(",").filter(Boolean))
+          : null;
+
+        if (allowedToolsSet) {
+          console.log(
+            `[/mcp] Tool filtering active: ${allowedToolsSet.size} tool(s) allowed`,
+          );
+        }
+
         mcpProxy({
           transportToClient: webAppTransport,
           transportToServer: serverTransport,
+          allowedTools: allowedToolsSet,
         });
 
         await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
@@ -1922,6 +1935,96 @@ async function writePersistedEnabledCredentialKeys(
   logger.info(
     `[credentials:enabled] Persisted ${enabledCredentialKeys.length} enabled credential key(s) to ${statePath}`,
   );
+}
+
+// ── Proxy Tool Selection Persistence ─────────────────────────────────────────
+// Persists which tools are enabled/disabled per credential in the state.json file.
+// The selection is stored under state.proxy.toolSelections[credentialId] = string[].
+// A null/undefined entry means "all tools" (backward compatible default).
+
+async function readPersistedProxyToolSelection(
+  folderPath?: string,
+  credentialId?: string,
+): Promise<string[] | null> {
+  const statePath = credentialsStatePath(folderPath);
+  try {
+    const fileContent = await fs.readFile(statePath, "utf8");
+    const state = JSON.parse(fileContent);
+    if (!state?.proxy?.toolSelections) return null;
+    if (credentialId) {
+      const selection = state.proxy.toolSelections[credentialId];
+      return Array.isArray(selection) ? selection : null;
+    }
+    return null;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      logger.warn(
+        `[proxy:tool-selection] Failed to read tool selection from ${statePath}:`,
+        error,
+      );
+    }
+    return null;
+  }
+}
+
+async function writePersistedProxyToolSelection(
+  folderPath: string | undefined,
+  credentialId: string,
+  selectedTools: string[] | null,
+): Promise<void> {
+  const folder = path.resolve(
+    expandTildePath(getEffectiveCredentialsFolderPath(folderPath)),
+  );
+  await fs.mkdir(folder, { recursive: true });
+  const statePath = credentialsStatePath(folder);
+  let state: Record<string, any> = {};
+  try {
+    state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      logger.warn(
+        `[proxy:tool-selection] Replacing unreadable state file ${statePath}:`,
+        error,
+      );
+    }
+  }
+
+  if (!state.proxy) state.proxy = {};
+  if (!state.proxy.toolSelections) state.proxy.toolSelections = {};
+
+  if (selectedTools === null) {
+    // null means "all tools" — remove the entry
+    delete state.proxy.toolSelections[credentialId];
+  } else {
+    state.proxy.toolSelections[credentialId] = selectedTools;
+  }
+  state.proxy.updatedAt = new Date().toISOString();
+  state.updatedAt = new Date().toISOString();
+
+  await fs.writeFile(statePath, JSON.stringify(state, null, 2), "utf8");
+  logger.info(
+    `[proxy:tool-selection] Persisted tool selection for ${credentialId}: ${selectedTools === null ? "all tools" : `${selectedTools.length} tool(s)`} to ${statePath}`,
+  );
+}
+
+async function readAllPersistedProxyToolSelections(
+  folderPath?: string,
+): Promise<Record<string, string[]>> {
+  const statePath = credentialsStatePath(folderPath);
+  try {
+    const fileContent = await fs.readFile(statePath, "utf8");
+    const state = JSON.parse(fileContent);
+    if (!state?.proxy?.toolSelections) return {};
+    return state.proxy.toolSelections;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      logger.warn(
+        `[proxy:tool-selection] Failed to read tool selections from ${statePath}:`,
+        error,
+      );
+    }
+    return {};
+  }
 }
 
 function credentialFilePath(meta: CredentialMeta): string {
@@ -3640,6 +3743,104 @@ app.put(
       });
     } catch (error: any) {
       logger.error(`[credentials:enabled] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// GET /proxy/tool-selection — Read persisted tool selection for a credential
+app.get(
+  "/proxy/tool-selection",
+  originValidationMiddleware,
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const credentialId = req.query.credentialId as string;
+      const folderPath = req.query.folderPath as string | undefined;
+
+      if (!credentialId) {
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'credentialId' query parameter is required",
+        });
+        return;
+      }
+
+      const effectiveFolderPath = getEffectiveCredentialsFolderPath(folderPath);
+      const selectedTools = await readPersistedProxyToolSelection(
+        effectiveFolderPath,
+        credentialId,
+      );
+
+      logger.info(
+        `[proxy:tool-selection] GET for ${credentialId}: ${selectedTools === null ? "no selection (all tools)" : `${selectedTools.length} tool(s)`}`,
+      );
+
+      res.json({
+        credentialId,
+        selectedTools, // null means "all tools" (default)
+        folderPath: effectiveFolderPath,
+      });
+    } catch (error: any) {
+      logger.error(`[proxy:tool-selection] GET error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// PUT /proxy/tool-selection — Persist tool selection for a credential
+app.put(
+  "/proxy/tool-selection",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { credentialId, selectedTools, folderPath } = req.body;
+
+      if (!credentialId || typeof credentialId !== "string") {
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'credentialId' is required and must be a string",
+        });
+        return;
+      }
+
+      // selectedTools: string[] = specific tools, null = all tools
+      const tools =
+        selectedTools === null
+          ? null
+          : Array.isArray(selectedTools)
+            ? selectedTools.filter(
+                (t: unknown): t is string => typeof t === "string",
+              )
+            : null;
+
+      const effectiveFolderPath = getEffectiveCredentialsFolderPath(folderPath);
+      await writePersistedProxyToolSelection(
+        effectiveFolderPath,
+        credentialId,
+        tools,
+      );
+
+      logger.info(
+        `[proxy:tool-selection] PUT for ${credentialId}: ${tools === null ? "all tools" : `${tools.length} tool(s)`}`,
+      );
+
+      res.json({
+        success: true,
+        credentialId,
+        selectedTools: tools,
+        folderPath: effectiveFolderPath,
+      });
+    } catch (error: any) {
+      logger.error(`[proxy:tool-selection] PUT error:`, error);
       res.status(500).json({
         error: "Internal Server Error",
         message: error?.message || String(error),
