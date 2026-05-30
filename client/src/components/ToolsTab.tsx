@@ -43,6 +43,7 @@ import ListPane from "./ListPane";
 import JsonView from "./JsonView";
 import ToolResults from "./ToolResults";
 import ToolRunDetailDialog, { type ToolRunData } from "./ToolRunDetailDialog";
+import type { RawCredentials } from "./CredentialsTab";
 import { useToast } from "@/lib/hooks/useToast";
 import useCopy from "@/lib/hooks/useCopy";
 import {
@@ -53,6 +54,19 @@ import {
 // Type guard to safely detect the optional _meta field without using `any`
 const hasMeta = (tool: Tool): tool is Tool & { _meta: unknown } =>
   typeof (tool as { _meta?: unknown })._meta !== "undefined";
+
+const normalizeCredentialUrl = (value: unknown): string | null => {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return value.trim().replace(/\/+$/, "");
+  }
+};
 
 const ToolsTab = ({
   tools,
@@ -69,6 +83,9 @@ const ToolsTab = ({
   currentServerConfig,
   loadedServers,
   config,
+  credentialsFolderPath,
+  enabledCredentials,
+  rawCredentials,
 }: {
   tools: Tool[];
   listTools: () => void;
@@ -87,6 +104,9 @@ const ToolsTab = ({
   currentServerConfig?: Record<string, unknown>;
   loadedServers?: Record<string, any>;
   config?: InspectorConfig;
+  credentialsFolderPath?: string;
+  enabledCredentials?: Set<string>;
+  rawCredentials?: RawCredentials | null;
 }) => {
   const [params, setParams] = useState<Record<string, unknown>>({});
   const [isToolRunning, setIsToolRunning] = useState(false);
@@ -327,16 +347,51 @@ const ToolsTab = ({
         }
       }
 
+      const serverUrl = normalizeCredentialUrl(server.url || server.sseUrl);
+      const requestBody: Record<string, unknown> = {
+        toolName: tool.name,
+        toolArgs: toolParams,
+        server,
+      };
+
+      if (serverUrl && credentialsFolderPath) {
+        const enabledKeys = enabledCredentials ? [...enabledCredentials] : [];
+        const allKeys = rawCredentials ? Object.keys(rawCredentials) : [];
+        const candidateKeys = [
+          ...enabledKeys.filter((key) => rawCredentials?.[key]),
+          ...allKeys.filter((key) => !enabledKeys.includes(key)),
+        ];
+        const matchingKey = candidateKeys.find(
+          (key) =>
+            normalizeCredentialUrl(rawCredentials?.[key]?.server_url) ===
+            serverUrl,
+        );
+        const matchingCredential = matchingKey
+          ? rawCredentials?.[matchingKey]
+          : null;
+
+        if (matchingKey && matchingCredential) {
+          requestBody.credentialMeta = {
+            folderPath: credentialsFolderPath,
+            sourceFile: matchingCredential._sourceFile || "credentials.json",
+            credentialKey: matchingKey,
+          };
+        } else {
+          requestBody.credentialsFolderPath = credentialsFolderPath;
+        }
+      }
+
       return `curl -X POST ${proxyUrl}/execute-tool \\
   -H "Origin: http://localhost:6274" \\
   -H "Content-Type: application/json" \\
-  -d '{
-    "toolName": "${tool.name}",
-    "toolArgs": ${JSON.stringify(toolParams, null, 2)},
-    "server": ${JSON.stringify(server, null, 2)}
-  }'`;
+  -d '${JSON.stringify(requestBody, null, 2)}'`;
     },
-    [currentServerConfig],
+    [
+      currentServerConfig,
+      credentialsFolderPath,
+      enabledCredentials,
+      rawCredentials,
+    ],
   );
 
   const generateCurlCommand = () => {

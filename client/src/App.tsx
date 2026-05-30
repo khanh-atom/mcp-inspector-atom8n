@@ -1816,6 +1816,9 @@ const App = () => {
                         currentServerConfig={serverConfigForCurl}
                         loadedServers={currentServers}
                         config={config}
+                        credentialsFolderPath={credentialsFolderPath}
+                        enabledCredentials={enabledCredentials}
+                        rawCredentials={rawCredentials}
                       />
                       <ConsoleTab />
                       <PingTab

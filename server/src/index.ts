@@ -1601,6 +1601,263 @@ app.post(
   },
 );
 
+// ── Credential Token Refresh Helpers ─────────────────────────────────────────
+// Extracted from /credentials/refresh so it can be reused by /execute-tool.
+const DEFAULT_CREDENTIALS_FOLDER = "./data";
+
+interface CredentialMeta {
+  folderPath: string;
+  sourceFile: string;
+  credentialKey: string;
+}
+
+interface CredentialRecord {
+  server_name?: string;
+  server_url?: string;
+  client_id?: string;
+  access_token?: string;
+  expires_at?: number;
+  refresh_token?: string;
+  scopes?: string[];
+  _sourceFile?: string;
+}
+
+interface RefreshResult {
+  accessToken: string;
+  expiresAt: number;
+  expiresInMs: number;
+}
+
+interface LocatedCredential {
+  meta: CredentialMeta;
+  credential: CredentialRecord;
+}
+
+function credentialFilePath(meta: CredentialMeta): string {
+  if (
+    !meta.sourceFile ||
+    meta.sourceFile.includes("/") ||
+    meta.sourceFile.includes("\\")
+  ) {
+    throw new Error(`Invalid credential source file: ${meta.sourceFile}`);
+  }
+
+  const folder = path.resolve(expandTildePath(meta.folderPath));
+  const filePath = path.resolve(folder, meta.sourceFile);
+  if (!filePath.startsWith(`${folder}${path.sep}`)) {
+    throw new Error(
+      `Credential source file is outside folder: ${meta.sourceFile}`,
+    );
+  }
+  return filePath;
+}
+
+async function readCredentialFile(
+  meta: CredentialMeta,
+): Promise<Record<string, CredentialRecord>> {
+  const filePath = credentialFilePath(meta);
+  try {
+    const fileContent = await fs.readFile(filePath, "utf8");
+    return JSON.parse(fileContent);
+  } catch (readErr: any) {
+    throw new Error(
+      `Credentials file not found or invalid: ${filePath} — ${readErr?.message}`,
+    );
+  }
+}
+
+async function readCredentialByMeta(
+  meta: CredentialMeta,
+): Promise<LocatedCredential> {
+  const credentials = await readCredentialFile(meta);
+  const credential = credentials[meta.credentialKey];
+  if (!credential) {
+    throw new Error(
+      `Credential key '${meta.credentialKey}' not found in ${meta.sourceFile}`,
+    );
+  }
+
+  return { meta, credential };
+}
+
+function normalizeServerUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+
+  try {
+    const url = new URL(value.trim());
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return value.trim().replace(/\/+$/, "");
+  }
+}
+
+function getServerConfigUrl(
+  serverConfig: Record<string, unknown>,
+): string | null {
+  return normalizeServerUrl(serverConfig.url || serverConfig.sseUrl);
+}
+
+async function findCredentialForServerUrl(
+  serverUrl: string | null,
+  folderPath?: string,
+  accessToken?: string,
+): Promise<LocatedCredential | null> {
+  if (!serverUrl) return null;
+
+  const normalizedServerUrl = normalizeServerUrl(serverUrl);
+  const candidateFolders = [
+    folderPath,
+    process.env.MCP_CREDENTIALS_FOLDER,
+    DEFAULT_CREDENTIALS_FOLDER,
+  ].filter((value): value is string => Boolean(value));
+  const uniqueFolders = [...new Set(candidateFolders)];
+  let bestMatch: (LocatedCredential & { score: number }) | null = null;
+
+  for (const candidateFolder of uniqueFolders) {
+    const folder = path.resolve(expandTildePath(candidateFolder));
+    let jsonFiles: string[];
+
+    try {
+      const stat = await fs.stat(folder);
+      if (!stat.isDirectory()) continue;
+      jsonFiles = (await fs.readdir(folder)).filter(
+        (fileName) => fileName.endsWith(".json") && !fileName.startsWith("."),
+      );
+    } catch {
+      continue;
+    }
+
+    for (const sourceFile of jsonFiles) {
+      const metaBase = {
+        folderPath: candidateFolder,
+        sourceFile,
+        credentialKey: "",
+      };
+
+      let credentials: Record<string, CredentialRecord>;
+      try {
+        credentials = await readCredentialFile(metaBase);
+      } catch (error) {
+        logger.warn(
+          `[credentials:lookup] Skipping invalid credential file ${sourceFile}:`,
+          error,
+        );
+        continue;
+      }
+
+      for (const [credentialKey, credential] of Object.entries(credentials)) {
+        if (normalizeServerUrl(credential.server_url) !== normalizedServerUrl) {
+          continue;
+        }
+
+        const score =
+          (accessToken && credential.access_token === accessToken ? 100 : 0) +
+          (credential.refresh_token ? 10 : 0) +
+          (credential.access_token ? 1 : 0);
+        if (!bestMatch || score > bestMatch.score) {
+          bestMatch = {
+            meta: { ...metaBase, credentialKey },
+            credential,
+            score,
+          };
+        }
+      }
+    }
+  }
+
+  if (bestMatch) {
+    logger.info(
+      `[credentials:lookup] Matched credential '${bestMatch.meta.credentialKey}' in ${bestMatch.meta.sourceFile} for ${serverUrl}`,
+    );
+  }
+
+  return bestMatch;
+}
+
+async function refreshCredentialToken(
+  meta: CredentialMeta,
+): Promise<RefreshResult> {
+  const filePath = credentialFilePath(meta);
+  logger.info(
+    `[credentials:refreshHelper] Refreshing token for key '${meta.credentialKey}' in ${filePath}`,
+  );
+
+  const credentials = await readCredentialFile(meta);
+  const cred = credentials[meta.credentialKey];
+  if (!cred) {
+    throw new Error(
+      `Credential key '${meta.credentialKey}' not found in ${meta.sourceFile}`,
+    );
+  }
+
+  if (!cred.refresh_token || !cred.client_id || !cred.server_url) {
+    throw new Error(
+      `Credential '${meta.credentialKey}' missing refresh_token, client_id, or server_url`,
+    );
+  }
+
+  // Derive token endpoint from server URL
+  const serverUrl = new URL(cred.server_url);
+  const apiHost = serverUrl.hostname.replace(/^mcp\./, "api.");
+  const tokenUrl = `https://${apiHost}/oauth2/v1/token`;
+
+  logger.info(
+    `[credentials:refreshHelper] Token refresh URL: ${tokenUrl} for server: ${cred.server_name || meta.credentialKey}`,
+  );
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: cred.refresh_token,
+    client_id: cred.client_id,
+  });
+
+  const tokenResp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  if (!tokenResp.ok) {
+    const text = await tokenResp.text();
+    throw new Error(`Token refresh failed (${tokenResp.status}): ${text}`);
+  }
+
+  const data = (await tokenResp.json()) as any;
+  if (!data.access_token) {
+    throw new Error("Token refresh response did not include access_token");
+  }
+  const expiresAt = Date.now() + (data.expires_in ?? 3600) * 1000;
+
+  // Update credential in memory
+  cred.access_token = data.access_token;
+  cred.refresh_token = data.refresh_token ?? cred.refresh_token;
+  cred.expires_at = expiresAt;
+  credentials[meta.credentialKey] = cred;
+
+  // Write back to the specific file
+  await fs.writeFile(filePath, JSON.stringify(credentials, null, 4), "utf8");
+
+  logger.info(
+    `[credentials:refreshHelper] Token refreshed & saved for '${meta.credentialKey}' in ${meta.sourceFile}. New expiry: ${new Date(cred.expires_at).toISOString()}`,
+  );
+
+  return {
+    accessToken: data.access_token,
+    expiresAt,
+    expiresInMs: expiresAt - Date.now(),
+  };
+}
+
+/** Check whether an error message indicates a 401 Unauthorized from the upstream server */
+function isUnauthorizedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  // Match patterns like "HTTP 401", "(401)", "401 Unauthorized", "Unauthorized"
+  return /\b401\b/i.test(msg) || /\bUnauthorized\b/i.test(msg);
+}
+
 // Helpers for execute-tool connection cache
 async function createExecuteToolConnection(
   serverConfig: Record<string, unknown>,
@@ -1716,6 +1973,7 @@ async function evictExecuteToolConnection(cacheKey: string): Promise<void> {
 }
 
 // New endpoint for on-demand tool execution (connections cached by serverName)
+// Supports automatic token refresh on 401 Unauthorized when credentials can be resolved.
 app.post(
   "/execute-tool",
   originValidationMiddleware,
@@ -1727,18 +1985,32 @@ app.post(
       toolName,
       toolArgs = {},
       credentials,
+      credentialMeta,
+      credentialsFolderPath,
     }: {
       serverName?: string;
       server?: Record<string, unknown>;
       toolName?: string;
       toolArgs?: Record<string, unknown>;
       credentials?: { access_token?: string };
+      credentialMeta?: CredentialMeta;
+      credentialsFolderPath?: string;
     } = req.body;
 
     // [CREDENTIALS] Log if credentials are being provided
     if (credentials?.access_token) {
       logger.info(
         `[execute-tool:credentials] Credentials provided for toolName=${toolName || "<missing>"}, token length=${credentials.access_token.length}`,
+      );
+    }
+    if (credentialMeta) {
+      logger.info(
+        `[execute-tool:credentials] credentialMeta provided: key=${credentialMeta.credentialKey}, file=${credentialMeta.sourceFile}`,
+      );
+    }
+    if (credentialsFolderPath) {
+      logger.info(
+        `[execute-tool:credentials] credentialsFolderPath provided: ${credentialsFolderPath}`,
       );
     }
 
@@ -1803,39 +2075,126 @@ app.post(
         `[execute-tool] Executing tool '${toolName}' via cacheKey='${cacheKey}'`,
       );
 
-      // [CREDENTIALS] Pass credential access_token to inject into HTTP transport
-      const { client } = await getOrCreateExecuteToolConnection(
-        cacheKey,
-        resolvedServerConfig,
-        req,
-        credentials?.access_token,
-      );
+      let locatedCredential: LocatedCredential | null = null;
+      let effectiveCredentialMeta = credentialMeta;
+      if (credentialMeta) {
+        try {
+          locatedCredential = await readCredentialByMeta(credentialMeta);
+        } catch (error) {
+          logger.warn(
+            "[execute-tool:credentials] Unable to read credentialMeta before execution:",
+            error,
+          );
+        }
+      } else {
+        locatedCredential = await findCredentialForServerUrl(
+          getServerConfigUrl(resolvedServerConfig),
+          credentialsFolderPath,
+          credentials?.access_token,
+        );
+        effectiveCredentialMeta = locatedCredential?.meta;
+      }
+
+      // [CREDENTIALS] Prefer an explicit request token, then the stored token.
+      let currentAccessToken =
+        credentials?.access_token || locatedCredential?.credential.access_token;
+      let tokenRefreshed = false;
+
+      if (!currentAccessToken && effectiveCredentialMeta) {
+        logger.info(
+          "[execute-tool:credentials] No access token supplied; refreshing matched credential before execution",
+        );
+        const refreshResult = await refreshCredentialToken(
+          effectiveCredentialMeta,
+        );
+        currentAccessToken = refreshResult.accessToken;
+        tokenRefreshed = true;
+      }
+
+      const runTool = async (accessToken?: string) => {
+        try {
+          const { client } = await getOrCreateExecuteToolConnection(
+            cacheKey,
+            resolvedServerConfig,
+            req,
+            accessToken,
+          );
+          return await client.callTool({
+            name: toolName,
+            arguments: toolArgs,
+          });
+        } catch (toolError) {
+          logger.warn(
+            `[execute-tool] Tool '${toolName}' failed; evicting cache key '${cacheKey}'`,
+          );
+          await evictExecuteToolConnection(cacheKey);
+          throw toolError;
+        }
+      };
 
       try {
-        const result = await client.callTool({
-          name: toolName,
-          arguments: toolArgs,
-        });
+        const result = await runTool(currentAccessToken);
         logger.info(`[execute-tool] Tool '${toolName}' completed successfully`);
         res.json({
           success: true,
           result,
           toolName,
+          ...(tokenRefreshed ? { tokenRefreshed } : {}),
           ...(resolvedServerName ? { serverName: resolvedServerName } : {}),
           ...(server ? { server } : {}),
         });
         return;
-      } catch (toolError) {
-        logger.warn(
-          `[execute-tool] Tool '${toolName}' failed; evicting cache key '${cacheKey}'`,
-        );
-        await evictExecuteToolConnection(cacheKey);
-        throw toolError;
+      } catch (executeError) {
+        // ── Auto-refresh on 401 Unauthorized ────────────────────────────
+        // If the MCP connection or tool call failed with a 401 and we have
+        // credential metadata, refresh and retry once.
+        if (isUnauthorizedError(executeError) && effectiveCredentialMeta) {
+          logger.info(
+            `[execute-tool:401-retry] Detected 401 for tool '${toolName}'. Attempting token refresh via credentialMeta...`,
+          );
+
+          try {
+            const refreshResult = await refreshCredentialToken(
+              effectiveCredentialMeta,
+            );
+            currentAccessToken = refreshResult.accessToken;
+            tokenRefreshed = true;
+
+            logger.info(
+              `[execute-tool:401-retry] Token refreshed successfully. New expiry: ${new Date(refreshResult.expiresAt).toISOString()}. Retrying tool call...`,
+            );
+
+            const retryResult = await runTool(currentAccessToken);
+
+            logger.info(
+              `[execute-tool:401-retry] Tool '${toolName}' succeeded after token refresh`,
+            );
+            res.json({
+              success: true,
+              result: retryResult,
+              toolName,
+              tokenRefreshed: true,
+              ...(resolvedServerName ? { serverName: resolvedServerName } : {}),
+              ...(server ? { server } : {}),
+            });
+            return;
+          } catch (refreshError) {
+            logger.error(
+              `[execute-tool:401-retry] Token refresh or retry failed:`,
+              refreshError,
+            );
+            await evictExecuteToolConnection(cacheKey);
+            throw refreshError;
+          }
+        }
+
+        throw executeError;
       }
     } catch (error) {
       logger.error("[execute-tool] Error executing tool:", error);
-      res.status(500).json({
-        error: "Internal Server Error",
+      const statusCode = isUnauthorizedError(error) ? 401 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 401 ? "Unauthorized" : "Internal Server Error",
         message: error instanceof Error ? error.message : String(error),
         serverName,
         toolName,
@@ -2493,6 +2852,7 @@ app.put(
 );
 
 // POST /credentials/refresh — Refresh an expired OAuth token (folder-aware)
+// Delegates to the shared refreshCredentialToken() helper.
 app.post(
   "/credentials/refresh",
   originValidationMiddleware,
@@ -2513,117 +2873,31 @@ app.post(
         return;
       }
 
-      const folder = expandTildePath(rawFolder);
-      const filePath = path.join(folder, sourceFile);
-      logger.info(
-        `[credentials:refresh] Refreshing token for key '${credentialKey}' in ${filePath}`,
-      );
-
-      // Read current credentials from the specific file
-      let credentials: Record<string, any>;
-      try {
-        const fileContent = await fs.readFile(filePath, "utf8");
-        credentials = JSON.parse(fileContent);
-      } catch (readErr: any) {
-        logger.error(
-          `[credentials:refresh] Failed to read credentials file:`,
-          readErr,
-        );
-        res.status(404).json({
-          error: "Not Found",
-          message: `Credentials file not found or invalid: ${filePath}`,
-        });
-        return;
-      }
-
-      const cred = credentials[credentialKey];
-      if (!cred) {
-        logger.warn(
-          `[credentials:refresh] Credential key '${credentialKey}' not found in ${sourceFile}`,
-        );
-        res.status(404).json({
-          error: "Not Found",
-          message: `Credential key '${credentialKey}' not found in ${sourceFile}`,
-        });
-        return;
-      }
-
-      if (!cred.refresh_token || !cred.client_id || !cred.server_url) {
-        logger.warn(
-          `[credentials:refresh] Credential '${credentialKey}' missing required fields for refresh`,
-        );
-        res.status(400).json({
-          error: "Bad Request",
-          message: "Credential missing refresh_token, client_id, or server_url",
-        });
-        return;
-      }
-
-      // Derive token endpoint from server URL
-      const serverUrl = new URL(cred.server_url);
-      const apiHost = serverUrl.hostname.replace(/^mcp\./, "api.");
-      const tokenUrl = `https://${apiHost}/oauth2/v1/token`;
-
-      logger.info(
-        `[credentials:refresh] Token refresh URL: ${tokenUrl} for server: ${cred.server_name || credentialKey}`,
-      );
-
-      const body = new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: cred.refresh_token,
-        client_id: cred.client_id,
+      const result = await refreshCredentialToken({
+        folderPath: rawFolder,
+        sourceFile,
+        credentialKey,
       });
-
-      const tokenResp = await fetch(tokenUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body.toString(),
-      });
-
-      if (!tokenResp.ok) {
-        const text = await tokenResp.text();
-        logger.error(
-          `[credentials:refresh] Token refresh failed (${tokenResp.status}): ${text}`,
-        );
-        res.status(tokenResp.status).json({
-          error: "Token Refresh Failed",
-          message: `Token refresh failed (${tokenResp.status}): ${text}`,
-        });
-        return;
-      }
-
-      const data = (await tokenResp.json()) as any;
-
-      // Update credential in memory
-      cred.access_token = data.access_token;
-      cred.refresh_token = data.refresh_token ?? cred.refresh_token;
-      cred.expires_at = Date.now() + (data.expires_in ?? 3600) * 1000;
-      credentials[credentialKey] = cred;
-
-      // Write back to the specific file
-      await fs.writeFile(
-        filePath,
-        JSON.stringify(credentials, null, 4),
-        "utf8",
-      );
-
-      logger.info(
-        `[credentials:refresh] Token refreshed & saved for '${credentialKey}' in ${sourceFile}. New expiry: ${new Date(cred.expires_at).toISOString()}`,
-      );
 
       res.json({
         success: true,
         message: "Token refreshed successfully",
         credentialKey,
         sourceFile,
-        accessToken: cred.access_token,
-        expiresAt: cred.expires_at,
-        expiresInMs: cred.expires_at - Date.now(),
+        accessToken: result.accessToken,
+        expiresAt: result.expiresAt,
+        expiresInMs: result.expiresInMs,
       });
     } catch (error: any) {
       logger.error(`[credentials:refresh] Error:`, error);
-      res.status(500).json({
-        error: "Internal Server Error",
+      const statusCode = error?.message?.includes("not found")
+        ? 404
+        : error?.message?.includes("missing")
+          ? 400
+          : 500;
+      res.status(statusCode).json({
+        error:
+          statusCode === 500 ? "Internal Server Error" : "Token Refresh Failed",
         message: error?.message || String(error),
       });
     }
