@@ -443,8 +443,38 @@ const CredentialsTab = ({
         "enabledCredentials",
         JSON.stringify([...newEnabled]),
       );
+      const persistEnabledState = async () => {
+        try {
+          const baseUrl = getMCPProxyAddress(config);
+          const { token, header } = getMCPProxyAuthToken(config);
+          const resp = await fetch(`${baseUrl}/credentials/enabled`, {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+              [header]: token ? `Bearer ${token}` : "",
+            },
+            body: JSON.stringify({
+              folderPath: credentialsFolderPath || "./data",
+              enabledCredentialKeys: [...newEnabled],
+            }),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            console.warn(
+              "[CredentialsTab] Failed to persist enabled credential state:",
+              err,
+            );
+          }
+        } catch (error) {
+          console.warn(
+            "[CredentialsTab] Error persisting enabled credential state:",
+            error,
+          );
+        }
+      };
+      void persistEnabledState();
     },
-    [enabledCredentials, setEnabledCredentials],
+    [config, credentialsFolderPath, enabledCredentials, setEnabledCredentials],
   );
 
   // Refresh a credential's token

@@ -1604,6 +1604,22 @@ app.post(
 // ── Credential Token Refresh Helpers ─────────────────────────────────────────
 // Extracted from /credentials/refresh so it can be reused by /execute-tool.
 const DEFAULT_CREDENTIALS_FOLDER = "./data";
+let activeCredentialsFolderPath =
+  process.env.MCP_CREDENTIALS_FOLDER || DEFAULT_CREDENTIALS_FOLDER;
+
+function setActiveCredentialsFolderPath(rawPath: string, reason: string): void {
+  if (!rawPath) return;
+  activeCredentialsFolderPath = rawPath;
+  logger.info(
+    `[credentials:active] Active credentials folder set to ${rawPath} (${reason})`,
+  );
+}
+
+function getEffectiveCredentialsFolderPath(folderPath?: string): string {
+  return (
+    folderPath || activeCredentialsFolderPath || DEFAULT_CREDENTIALS_FOLDER
+  );
+}
 
 interface CredentialMeta {
   folderPath: string;
@@ -1631,6 +1647,68 @@ interface RefreshResult {
 interface LocatedCredential {
   meta: CredentialMeta;
   credential: CredentialRecord;
+}
+
+function enabledCredentialsStatePath(folderPath?: string): string {
+  return path.join(
+    path.resolve(
+      expandTildePath(getEffectiveCredentialsFolderPath(folderPath)),
+    ),
+    ".enabled-credentials.json",
+  );
+}
+
+async function readPersistedEnabledCredentialKeys(
+  folderPath?: string,
+): Promise<string[] | null> {
+  const statePath = enabledCredentialsStatePath(folderPath);
+  try {
+    const fileContent = await fs.readFile(statePath, "utf8");
+    const parsed = JSON.parse(fileContent);
+    if (!Array.isArray(parsed.enabledCredentialKeys)) {
+      logger.warn(
+        `[credentials:enabled] Invalid enabled state file shape: ${statePath}`,
+      );
+      return null;
+    }
+    return parsed.enabledCredentialKeys.filter(
+      (value: unknown): value is string => typeof value === "string",
+    );
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      logger.warn(
+        `[credentials:enabled] Failed to read enabled state file ${statePath}:`,
+        error,
+      );
+    }
+    return null;
+  }
+}
+
+async function writePersistedEnabledCredentialKeys(
+  folderPath: string | undefined,
+  enabledCredentialKeys: string[],
+): Promise<void> {
+  const folder = path.resolve(
+    expandTildePath(getEffectiveCredentialsFolderPath(folderPath)),
+  );
+  await fs.mkdir(folder, { recursive: true });
+  const statePath = enabledCredentialsStatePath(folder);
+  await fs.writeFile(
+    statePath,
+    JSON.stringify(
+      {
+        enabledCredentialKeys,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  logger.info(
+    `[credentials:enabled] Persisted ${enabledCredentialKeys.length} enabled credential key(s) to ${statePath}`,
+  );
 }
 
 function credentialFilePath(meta: CredentialMeta): string {
@@ -1704,29 +1782,59 @@ async function findCredentialForServerUrl(
   serverUrl: string | null,
   folderPath?: string,
   accessToken?: string,
+  enabledCredentialKeys?: string[],
 ): Promise<LocatedCredential | null> {
-  if (!serverUrl) return null;
-
+  if (!serverUrl) {
+    logger.info("[credentials:lookup] Skipped: no server URL to match");
+    return null;
+  }
+  const effectiveFolderPath = getEffectiveCredentialsFolderPath(folderPath);
+  const persistedEnabledKeys =
+    enabledCredentialKeys ??
+    (await readPersistedEnabledCredentialKeys(effectiveFolderPath));
   const normalizedServerUrl = normalizeServerUrl(serverUrl);
-  const candidateFolders = [
-    folderPath,
-    process.env.MCP_CREDENTIALS_FOLDER,
-    DEFAULT_CREDENTIALS_FOLDER,
-  ].filter((value): value is string => Boolean(value));
-  const uniqueFolders = [...new Set(candidateFolders)];
+  const allowedCredentialKeys = persistedEnabledKeys
+    ? new Set(persistedEnabledKeys)
+    : null;
   let bestMatch: (LocatedCredential & { score: number }) | null = null;
 
-  for (const candidateFolder of uniqueFolders) {
+  logger.info(
+    `[credentials:lookup] Starting lookup serverUrl=${serverUrl} normalized=${normalizedServerUrl} folderPath=${effectiveFolderPath} enabledKeys=${
+      persistedEnabledKeys
+        ? persistedEnabledKeys.length
+        : "<all; no state file>"
+    } source=${
+      enabledCredentialKeys
+        ? "request"
+        : persistedEnabledKeys
+          ? "persisted"
+          : "default-all"
+    } hasRequestAccessToken=${Boolean(accessToken)}`,
+  );
+
+  for (const candidateFolder of [effectiveFolderPath]) {
     const folder = path.resolve(expandTildePath(candidateFolder));
     let jsonFiles: string[];
 
     try {
       const stat = await fs.stat(folder);
-      if (!stat.isDirectory()) continue;
+      if (!stat.isDirectory()) {
+        logger.warn(
+          `[credentials:lookup] Skipping ${folder}: path is not a directory`,
+        );
+        continue;
+      }
       jsonFiles = (await fs.readdir(folder)).filter(
         (fileName) => fileName.endsWith(".json") && !fileName.startsWith("."),
       );
-    } catch {
+      logger.info(
+        `[credentials:lookup] Folder ${folder} has ${jsonFiles.length} JSON file(s)`,
+      );
+    } catch (error) {
+      logger.warn(
+        `[credentials:lookup] Unable to read credential folder ${folder}:`,
+        error,
+      );
       continue;
     }
 
@@ -1749,7 +1857,21 @@ async function findCredentialForServerUrl(
       }
 
       for (const [credentialKey, credential] of Object.entries(credentials)) {
-        if (normalizeServerUrl(credential.server_url) !== normalizedServerUrl) {
+        if (
+          allowedCredentialKeys &&
+          !allowedCredentialKeys.has(credentialKey)
+        ) {
+          logger.info(
+            `[credentials:lookup] Skipping key '${credentialKey}' from ${sourceFile}: not enabled for this request`,
+          );
+          continue;
+        }
+
+        const credentialServerUrl = normalizeServerUrl(credential.server_url);
+        if (credentialServerUrl !== normalizedServerUrl) {
+          logger.info(
+            `[credentials:lookup] Skipping key '${credentialKey}' from ${sourceFile}: server URL mismatch credential=${credentialServerUrl} request=${normalizedServerUrl}`,
+          );
           continue;
         }
 
@@ -1771,6 +1893,14 @@ async function findCredentialForServerUrl(
   if (bestMatch) {
     logger.info(
       `[credentials:lookup] Matched credential '${bestMatch.meta.credentialKey}' in ${bestMatch.meta.sourceFile} for ${serverUrl}`,
+    );
+  } else {
+    logger.info(
+      `[credentials:lookup] No credential matched for ${serverUrl}. Enabled keys: ${
+        persistedEnabledKeys
+          ? persistedEnabledKeys.join(", ") || "<none>"
+          : "<all>"
+      }`,
     );
   }
 
@@ -1987,6 +2117,7 @@ app.post(
       credentials,
       credentialMeta,
       credentialsFolderPath,
+      enabledCredentialKeys,
     }: {
       serverName?: string;
       server?: Record<string, unknown>;
@@ -1995,9 +2126,20 @@ app.post(
       credentials?: { access_token?: string };
       credentialMeta?: CredentialMeta;
       credentialsFolderPath?: string;
+      enabledCredentialKeys?: string[];
     } = req.body;
 
     // [CREDENTIALS] Log if credentials are being provided
+    logger.info(
+      `[execute-tool:request] Body keys: ${Object.keys(req.body || {}).join(", ") || "<none>"}`,
+    );
+    logger.info(
+      `[execute-tool:request] Credential fields present: credentials=${Boolean(credentials)}, credentialMeta=${Boolean(credentialMeta)}, credentialsFolderPath=${Boolean(credentialsFolderPath)}, enabledCredentialKeys=${
+        Array.isArray(enabledCredentialKeys)
+          ? `${enabledCredentialKeys.length} key(s)`
+          : "<missing>"
+      }`,
+    );
     if (credentials?.access_token) {
       logger.info(
         `[execute-tool:credentials] Credentials provided for toolName=${toolName || "<missing>"}, token length=${credentials.access_token.length}`,
@@ -2011,6 +2153,11 @@ app.post(
     if (credentialsFolderPath) {
       logger.info(
         `[execute-tool:credentials] credentialsFolderPath provided: ${credentialsFolderPath}`,
+      );
+    }
+    if (enabledCredentialKeys) {
+      logger.info(
+        `[execute-tool:credentials] enabledCredentialKeys provided: ${enabledCredentialKeys.length} (${enabledCredentialKeys.join(", ") || "<empty>"})`,
       );
     }
 
@@ -2074,6 +2221,9 @@ app.post(
       logger.info(
         `[execute-tool] Executing tool '${toolName}' via cacheKey='${cacheKey}'`,
       );
+      logger.info(
+        `[execute-tool] Resolved server URL for credential lookup: ${getServerConfigUrl(resolvedServerConfig) || "<none>"}`,
+      );
 
       let locatedCredential: LocatedCredential | null = null;
       let effectiveCredentialMeta = credentialMeta;
@@ -2091,14 +2241,31 @@ app.post(
           getServerConfigUrl(resolvedServerConfig),
           credentialsFolderPath,
           credentials?.access_token,
+          enabledCredentialKeys,
         );
         effectiveCredentialMeta = locatedCredential?.meta;
       }
+      logger.info(
+        `[execute-tool:credentials] Lookup result: located=${Boolean(locatedCredential)}, effectiveMeta=${
+          effectiveCredentialMeta
+            ? `${effectiveCredentialMeta.credentialKey} (${effectiveCredentialMeta.sourceFile})`
+            : "<none>"
+        }`,
+      );
 
       // [CREDENTIALS] Prefer an explicit request token, then the stored token.
       let currentAccessToken =
         credentials?.access_token || locatedCredential?.credential.access_token;
       let tokenRefreshed = false;
+      logger.info(
+        `[execute-tool:credentials] Access token source before refresh: ${
+          credentials?.access_token
+            ? "request.credentials"
+            : locatedCredential?.credential.access_token
+              ? "stored credential"
+              : "<none>"
+        }`,
+      );
 
       if (!currentAccessToken && effectiveCredentialMeta) {
         logger.info(
@@ -2702,6 +2869,7 @@ app.get(
       }
 
       const folderPath = expandTildePath(rawPath);
+      setActiveCredentialsFolderPath(rawPath, "GET /credentials");
       logger.info(
         `[credentials:GET] Reading credentials folder: ${folderPath}`,
       );
@@ -2843,6 +3011,52 @@ app.put(
       });
     } catch (error: any) {
       logger.error(`[credentials:PUT] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// PUT /credentials/enabled — Persist enabled credential keys for server-side lookup
+app.put(
+  "/credentials/enabled",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { folderPath, enabledCredentialKeys } = req.body;
+      if (!Array.isArray(enabledCredentialKeys)) {
+        logger.warn(
+          "[credentials:enabled] Missing or invalid 'enabledCredentialKeys'",
+        );
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'enabledCredentialKeys' must be an array",
+        });
+        return;
+      }
+
+      const keys = enabledCredentialKeys.filter(
+        (value: unknown): value is string => typeof value === "string",
+      );
+      const effectiveFolderPath = getEffectiveCredentialsFolderPath(folderPath);
+      setActiveCredentialsFolderPath(
+        effectiveFolderPath,
+        "PUT /credentials/enabled",
+      );
+      await writePersistedEnabledCredentialKeys(effectiveFolderPath, keys);
+
+      res.json({
+        success: true,
+        folderPath: effectiveFolderPath,
+        enabledCredentialKeys: keys,
+        count: keys.length,
+      });
+    } catch (error: any) {
+      logger.error(`[credentials:enabled] Error:`, error);
       res.status(500).json({
         error: "Internal Server Error",
         message: error?.message || String(error),

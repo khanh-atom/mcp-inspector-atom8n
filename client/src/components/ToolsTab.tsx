@@ -68,6 +68,16 @@ const normalizeCredentialUrl = (value: unknown): string | null => {
   }
 };
 
+const readEnabledCredentialKeysFromStorage = (): string[] => {
+  try {
+    const saved = localStorage.getItem("enabledCredentials");
+    return saved ? (JSON.parse(saved) as string[]) : [];
+  } catch (error) {
+    console.warn("[ToolsTab] Failed to read enabledCredentials", error);
+    return [];
+  }
+};
+
 const ToolsTab = ({
   tools,
   listTools,
@@ -354,14 +364,20 @@ const ToolsTab = ({
         server,
       };
 
-      if (serverUrl && credentialsFolderPath) {
-        const enabledKeys = enabledCredentials ? [...enabledCredentials] : [];
-        const allKeys = rawCredentials ? Object.keys(rawCredentials) : [];
-        const candidateKeys = [
-          ...enabledKeys.filter((key) => rawCredentials?.[key]),
-          ...allKeys.filter((key) => !enabledKeys.includes(key)),
-        ];
-        const matchingKey = candidateKeys.find(
+      const effectiveCredentialsFolderPath =
+        credentialsFolderPath ||
+        localStorage.getItem("credentialsFolderPath") ||
+        "./data";
+      const enabledKeys =
+        enabledCredentials && enabledCredentials.size > 0
+          ? [...enabledCredentials]
+          : readEnabledCredentialKeysFromStorage();
+
+      if (serverUrl && effectiveCredentialsFolderPath) {
+        requestBody.credentialsFolderPath = effectiveCredentialsFolderPath;
+        requestBody.enabledCredentialKeys = enabledKeys;
+
+        const matchingKey = enabledKeys.find(
           (key) =>
             normalizeCredentialUrl(rawCredentials?.[key]?.server_url) ===
             serverUrl,
@@ -372,14 +388,19 @@ const ToolsTab = ({
 
         if (matchingKey && matchingCredential) {
           requestBody.credentialMeta = {
-            folderPath: credentialsFolderPath,
+            folderPath: effectiveCredentialsFolderPath,
             sourceFile: matchingCredential._sourceFile || "credentials.json",
             credentialKey: matchingKey,
           };
-        } else {
-          requestBody.credentialsFolderPath = credentialsFolderPath;
         }
       }
+      console.log("[ToolsTab] Generated execute-tool cURL body", {
+        bodyKeys: Object.keys(requestBody),
+        serverUrl,
+        credentialsFolderPath: requestBody.credentialsFolderPath,
+        enabledCredentialKeys: requestBody.enabledCredentialKeys,
+        credentialMeta: requestBody.credentialMeta,
+      });
 
       return `curl -X POST ${proxyUrl}/execute-tool \\
   -H "Origin: http://localhost:6274" \\
