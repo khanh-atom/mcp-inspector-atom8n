@@ -966,8 +966,13 @@ const CredentialsTab = ({
         // The /mcp endpoint uses query params to know which upstream server to proxy to.
         const proxyBaseUrl = getMCPProxyAddress(config);
         const proxyUrl = `${proxyBaseUrl}/mcp?url=${encodeURIComponent(entry.serverUrl)}&transportType=streamable-http`;
+        // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
+        const isAntigravity =
+          configFilePath?.includes("antigravity") ||
+          configFilePath?.includes("gemini");
+        const urlKey = isAntigravity ? "serverUrl" : "url";
         const proxyServerConfig = {
-          url: proxyUrl,
+          [urlKey]: proxyUrl,
           type: "streamable-http",
           disabled: false,
         };
@@ -1255,8 +1260,13 @@ const CredentialsTab = ({
     // The /mcp endpoint uses query params to know which upstream server to proxy to.
     const proxyBaseUrl = getMCPProxyAddress(config);
     const proxyUrl = `${proxyBaseUrl}/mcp?url=${encodeURIComponent(proxyEntry.serverUrl)}&transportType=streamable-http`;
+    // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
+    const isAntigravity =
+      configFilePath?.includes("antigravity") ||
+      configFilePath?.includes("gemini");
+    const urlKey = isAntigravity ? "serverUrl" : "url";
     const serverConfig: Record<string, unknown> = {
-      url: proxyUrl,
+      [urlKey]: proxyUrl,
       type: "streamable-http",
     };
 
