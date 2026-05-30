@@ -468,17 +468,71 @@ const createTransport = async (
     await transport.start();
     return { transport, headerHolder };
   } else if (transportType === "streamable-http") {
+    const upstreamUrl = query.url as string;
     const headers = getHttpHeaders(req);
     headers["Accept"] = "text/event-stream, application/json";
+
+    // [PROXY] Auto-inject credentials if no Authorization header present
+    if (!headers["Authorization"] && !headers["authorization"]) {
+      console.log(
+        `[createTransport:proxy] No Authorization header from client, looking up credentials for ${upstreamUrl}`,
+      );
+      try {
+        const located = await findCredentialForServerUrl(upstreamUrl);
+        if (located?.credential.access_token) {
+          // Check if token is expired and auto-refresh
+          const safetyMarginMs = 60_000;
+          if (
+            located.credential.expires_at &&
+            located.credential.expires_at <= Date.now() + safetyMarginMs &&
+            located.meta
+          ) {
+            console.log(
+              "[createTransport:proxy] Token expired or expiring soon, refreshing...",
+            );
+            try {
+              const refreshResult = await refreshCredentialToken(located.meta);
+              headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
+              console.log("[createTransport:proxy] Injected refreshed token");
+            } catch (refreshErr) {
+              // Fall back to the existing (possibly expired) token
+              headers["Authorization"] =
+                `Bearer ${located.credential.access_token}`;
+              console.warn(
+                "[createTransport:proxy] Refresh failed, using existing token:",
+                refreshErr,
+              );
+            }
+          } else {
+            headers["Authorization"] =
+              `Bearer ${located.credential.access_token}`;
+            console.log(
+              "[createTransport:proxy] Injected credential token for upstream URL",
+            );
+          }
+        } else {
+          console.log(
+            "[createTransport:proxy] No matching credential found for upstream URL",
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "[createTransport:proxy] Credential lookup failed:",
+          error,
+        );
+      }
+    } else {
+      console.log(
+        "[createTransport:proxy] Client already provided Authorization header",
+      );
+    }
+
     const headerHolder = { headers };
 
-    const transport = new StreamableHTTPClientTransport(
-      new URL(query.url as string),
-      {
-        // Pass a custom fetch to inject the latest headers on each request
-        fetch: createCustomFetch(headerHolder),
-      },
-    );
+    const transport = new StreamableHTTPClientTransport(new URL(upstreamUrl), {
+      // Pass a custom fetch to inject the latest headers on each request
+      fetch: createCustomFetch(headerHolder),
+    });
     await transport.start();
     return { transport, headerHolder };
   } else {
