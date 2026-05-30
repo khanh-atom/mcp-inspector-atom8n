@@ -3644,6 +3644,9 @@ app.get(
         `[credentials:GET] Total: ${allEntries.length} credential(s) from ${files.length} file(s)`,
       );
 
+      const proxyToolSelections =
+        await readAllPersistedProxyToolSelections(rawPath);
+
       res.json({
         success: true,
         path: folderPath,
@@ -3651,6 +3654,7 @@ app.get(
         entries: allEntries,
         files,
         count: allEntries.length,
+        proxyToolSelections,
       });
     } catch (error: any) {
       logger.error(`[credentials:GET] Unhandled error:`, error);

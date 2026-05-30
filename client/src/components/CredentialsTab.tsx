@@ -93,6 +93,8 @@ interface ProxyToolInfo {
   inputSchema?: Record<string, unknown>;
 }
 
+type ProxyToolSelectionCounts = Record<string, number>;
+
 interface CredentialsTabProps {
   config: InspectorConfig;
   credentialsFolderPath: string;
@@ -205,6 +207,8 @@ const CredentialsTab = ({
   const [proxySelectedTools, setProxySelectedTools] = useState<Set<string>>(
     new Set(),
   );
+  const [proxyToolSelectionCounts, setProxyToolSelectionCounts] =
+    useState<ProxyToolSelectionCounts>({});
   const [proxySearchQuery, setProxySearchQuery] = useState("");
   const [installingCredentialId, setInstallingCredentialId] = useState<
     string | null
@@ -217,6 +221,39 @@ const CredentialsTab = ({
     enabledCount: enabledCredentials.size,
     hasRawCredentials: !!rawCredentials,
   });
+
+  const syncProxyToolSelectionCounts = useCallback(
+    (toolSelections: unknown, loadedEntries: CredentialEntry[]) => {
+      if (
+        !toolSelections ||
+        typeof toolSelections !== "object" ||
+        Array.isArray(toolSelections)
+      ) {
+        setProxyToolSelectionCounts({});
+        return;
+      }
+
+      const credentialIds = new Set(
+        loadedEntries.map((entry) => getCredentialIdentity(entry)),
+      );
+      const nextCounts: ProxyToolSelectionCounts = {};
+
+      for (const [credentialId, selectedTools] of Object.entries(
+        toolSelections,
+      )) {
+        if (!credentialIds.has(credentialId) || !Array.isArray(selectedTools)) {
+          continue;
+        }
+
+        nextCounts[credentialId] = selectedTools.filter(
+          (tool): tool is string => typeof tool === "string",
+        ).length;
+      }
+
+      setProxyToolSelectionCounts(nextCounts);
+    },
+    [],
+  );
 
   // Load credentials from folder (reads all .json files)
   const loadCredentials = useCallback(
@@ -270,6 +307,7 @@ const CredentialsTab = ({
         const loadedEntries = (data.entries || []) as CredentialEntry[];
         setEntries(loadedEntries);
         setRawCredentials(data.credentials || null);
+        syncProxyToolSelectionCounts(data.proxyToolSelections, loadedEntries);
 
         // Auto-enable all credentials on first load if none are enabled
         if (enabledCredentials.size === 0 && loadedEntries.length > 0) {
@@ -318,6 +356,7 @@ const CredentialsTab = ({
       enabledCredentials,
       setEnabledCredentials,
       setRawCredentials,
+      syncProxyToolSelectionCounts,
       toast,
     ],
   );
@@ -1231,23 +1270,42 @@ const CredentialsTab = ({
                 `[CredentialsTab:proxy] Restored persisted selection: ${persisted.size}/${tools.length} tool(s)`,
               );
               setProxySelectedTools(persisted);
+              setProxyToolSelectionCounts((counts) => ({
+                ...counts,
+                [credentialId]: persisted.size,
+              }));
             } else {
               // No persisted selection — default to all tools
               console.log(
                 "[CredentialsTab:proxy] No persisted selection, defaulting to all tools",
               );
-              setProxySelectedTools(new Set(tools.map((t) => t.name)));
+              const allTools = new Set(tools.map((t) => t.name));
+              setProxySelectedTools(allTools);
+              setProxyToolSelectionCounts((counts) => ({
+                ...counts,
+                [credentialId]: allTools.size,
+              }));
             }
           } else {
             // Fallback: select all tools
-            setProxySelectedTools(new Set(tools.map((t) => t.name)));
+            const allTools = new Set(tools.map((t) => t.name));
+            setProxySelectedTools(allTools);
+            setProxyToolSelectionCounts((counts) => ({
+              ...counts,
+              [credentialId]: allTools.size,
+            }));
           }
         } catch (selError) {
           console.warn(
             "[CredentialsTab:proxy] Failed to load persisted tool selection, defaulting to all:",
             selError,
           );
-          setProxySelectedTools(new Set(tools.map((t) => t.name)));
+          const allTools = new Set(tools.map((t) => t.name));
+          setProxySelectedTools(allTools);
+          setProxyToolSelectionCounts((counts) => ({
+            ...counts,
+            [credentialId]: allTools.size,
+          }));
         }
       } catch (error) {
         console.error("[CredentialsTab:proxy] Error fetching tools:", error);
@@ -1315,6 +1373,9 @@ const CredentialsTab = ({
   // [PROXY] Toggle a tool in the proxy selection
   const handleToggleProxyTool = useCallback(
     (toolName: string) => {
+      const credentialId = proxyEntry
+        ? getCredentialIdentity(proxyEntry)
+        : null;
       setProxySelectedTools((prev) => {
         const next = new Set(prev);
         if (next.has(toolName)) {
@@ -1325,9 +1386,12 @@ const CredentialsTab = ({
           console.log(`[CredentialsTab:proxy] Selected tool: ${toolName}`);
         }
         // Persist the updated selection
-        if (proxyEntry) {
-          const credentialId = getCredentialIdentity(proxyEntry);
+        if (credentialId) {
           persistProxyToolSelection(credentialId, next);
+          setProxyToolSelectionCounts((counts) => ({
+            ...counts,
+            [credentialId]: next.size,
+          }));
         }
         return next;
       });
@@ -1352,6 +1416,10 @@ const CredentialsTab = ({
     if (proxyEntry) {
       const credentialId = getCredentialIdentity(proxyEntry);
       persistProxyToolSelection(credentialId, nextSet);
+      setProxyToolSelectionCounts((counts) => ({
+        ...counts,
+        [credentialId]: nextSet.size,
+      }));
     }
   }, [proxyTools, proxySelectedTools, proxyEntry, persistProxyToolSelection]);
 
@@ -1664,6 +1732,8 @@ const CredentialsTab = ({
                     enabledCredentials.has(entry.key);
                   const expiryStatus = getExpiryStatus(entry);
                   const isRefreshing = refreshingKey === credentialId;
+                  const enabledToolCount =
+                    proxyToolSelectionCounts[credentialId];
 
                   return (
                     <Card
@@ -1995,6 +2065,14 @@ const CredentialsTab = ({
                                   <Network className="w-3.5 h-3.5 mr-1" />
                                   Proxy
                                 </Button>
+                                {typeof enabledToolCount === "number" && (
+                                  <Badge
+                                    className="h-5 min-w-5 px-1.5 justify-center text-[10px] font-semibold"
+                                    title={`${enabledToolCount} enabled proxy tool${enabledToolCount === 1 ? "" : "s"}`}
+                                  >
+                                    {enabledToolCount}
+                                  </Badge>
+                                )}
                               </>
                             );
                           })()}
