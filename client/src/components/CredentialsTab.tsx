@@ -963,9 +963,16 @@ const CredentialsTab = ({
       try {
         const proxyKey = getProxyServerKey(entry);
         // [PROXY] Point to the LOCAL proxy server at port 6277, NOT the remote server directly.
-        // The /mcp endpoint uses query params to know which upstream server to proxy to.
+        // Include credential identity so the proxy can load the exact credential (no search needed).
         const proxyBaseUrl = getMCPProxyAddress(config);
-        const proxyUrl = `${proxyBaseUrl}/mcp?url=${encodeURIComponent(entry.serverUrl)}&transportType=streamable-http`;
+        const proxyParams = new URLSearchParams({
+          url: entry.serverUrl,
+          transportType: "streamable-http",
+          credentialFile: entry.sourceFile,
+          credentialKey: entry.key,
+          credentialFolder: credentialsFolderPath || "",
+        });
+        const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
         // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
         const isAntigravity =
           configFilePath?.includes("antigravity") ||
@@ -1257,9 +1264,16 @@ const CredentialsTab = ({
     const proxyKey = getProxyServerKey(proxyEntry);
 
     // [PROXY] Point to the LOCAL proxy server, NOT the remote server directly.
-    // The /mcp endpoint uses query params to know which upstream server to proxy to.
+    // Include credential identity so the proxy can load the exact credential.
     const proxyBaseUrl = getMCPProxyAddress(config);
-    const proxyUrl = `${proxyBaseUrl}/mcp?url=${encodeURIComponent(proxyEntry.serverUrl)}&transportType=streamable-http`;
+    const proxyParams = new URLSearchParams({
+      url: proxyEntry.serverUrl,
+      transportType: "streamable-http",
+      credentialFile: proxyEntry.sourceFile,
+      credentialKey: proxyEntry.key,
+      credentialFolder: credentialsFolderPath || "",
+    });
+    const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
     // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
     const isAntigravity =
       configFilePath?.includes("antigravity") ||

@@ -474,28 +474,35 @@ const createTransport = async (
 
     // [PROXY] Auto-inject credentials if no Authorization header present
     if (!headers["Authorization"] && !headers["authorization"]) {
-      console.log(
-        `[createTransport:proxy] No Authorization header from client, looking up credentials for ${upstreamUrl}`,
-      );
-      try {
-        const located = await findCredentialForServerUrl(upstreamUrl);
-        if (located?.credential.access_token) {
-          // Check if token is expired and auto-refresh
+      const credentialFile = query.credentialFile as string | undefined;
+      const credentialKey = query.credentialKey as string | undefined;
+      const credentialFolder = query.credentialFolder as string | undefined;
+
+      // [PROXY] Prefer direct credential lookup by identity (from Install)
+      if (credentialFile && credentialKey) {
+        const meta: CredentialMeta = {
+          folderPath: credentialFolder || "./data",
+          sourceFile: credentialFile,
+          credentialKey: credentialKey,
+        };
+        console.log(
+          `[createTransport:proxy] Direct credential lookup: ${credentialFile}/${credentialKey}`,
+        );
+        try {
+          const located = await readCredentialByMeta(meta);
           const safetyMarginMs = 60_000;
           if (
             located.credential.expires_at &&
-            located.credential.expires_at <= Date.now() + safetyMarginMs &&
-            located.meta
+            located.credential.expires_at <= Date.now() + safetyMarginMs
           ) {
             console.log(
-              "[createTransport:proxy] Token expired or expiring soon, refreshing...",
+              "[createTransport:proxy] Token expired or expiring, refreshing...",
             );
             try {
-              const refreshResult = await refreshCredentialToken(located.meta);
+              const refreshResult = await refreshCredentialToken(meta);
               headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
               console.log("[createTransport:proxy] Injected refreshed token");
             } catch (refreshErr) {
-              // Fall back to the existing (possibly expired) token
               headers["Authorization"] =
                 `Bearer ${located.credential.access_token}`;
               console.warn(
@@ -507,19 +514,65 @@ const createTransport = async (
             headers["Authorization"] =
               `Bearer ${located.credential.access_token}`;
             console.log(
-              "[createTransport:proxy] Injected credential token for upstream URL",
+              "[createTransport:proxy] Injected token from direct credential lookup",
             );
           }
-        } else {
-          console.log(
-            "[createTransport:proxy] No matching credential found for upstream URL",
+        } catch (error) {
+          console.warn(
+            "[createTransport:proxy] Direct credential lookup failed:",
+            error,
           );
         }
-      } catch (error) {
-        console.warn(
-          "[createTransport:proxy] Credential lookup failed:",
-          error,
+      } else {
+        // [PROXY] Fallback: search by upstream URL
+        console.log(
+          `[createTransport:proxy] No credential identity in query, searching by URL: ${upstreamUrl}`,
         );
+        try {
+          const located = await findCredentialForServerUrl(upstreamUrl);
+          if (located?.credential.access_token) {
+            const safetyMarginMs = 60_000;
+            if (
+              located.credential.expires_at &&
+              located.credential.expires_at <= Date.now() + safetyMarginMs &&
+              located.meta
+            ) {
+              console.log(
+                "[createTransport:proxy] Token expired or expiring, refreshing...",
+              );
+              try {
+                const refreshResult = await refreshCredentialToken(
+                  located.meta,
+                );
+                headers["Authorization"] =
+                  `Bearer ${refreshResult.accessToken}`;
+                console.log("[createTransport:proxy] Injected refreshed token");
+              } catch (refreshErr) {
+                headers["Authorization"] =
+                  `Bearer ${located.credential.access_token}`;
+                console.warn(
+                  "[createTransport:proxy] Refresh failed, using existing token:",
+                  refreshErr,
+                );
+              }
+            } else {
+              headers["Authorization"] =
+                `Bearer ${located.credential.access_token}`;
+              console.log(
+                "[createTransport:proxy] Injected credential from URL search",
+              );
+            }
+          } else {
+            console.log(
+              "[createTransport:proxy] No matching credential found for upstream URL",
+            );
+          }
+        } catch (error) {
+          console.warn(
+            "[createTransport:proxy] Credential URL search failed:",
+            error,
+          );
+        }
       }
     } else {
       console.log(
