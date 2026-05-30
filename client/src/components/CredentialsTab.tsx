@@ -2064,15 +2064,10 @@ const CredentialsTab = ({
                                 >
                                   <Network className="w-3.5 h-3.5 mr-1" />
                                   Proxy
+                                  {typeof enabledToolCount === "number"
+                                    ? ` (${enabledToolCount})`
+                                    : ""}
                                 </Button>
-                                {typeof enabledToolCount === "number" && (
-                                  <Badge
-                                    className="h-5 min-w-5 px-1.5 justify-center text-[10px] font-semibold"
-                                    title={`${enabledToolCount} enabled proxy tool${enabledToolCount === 1 ? "" : "s"}`}
-                                  >
-                                    {enabledToolCount}
-                                  </Badge>
-                                )}
                               </>
                             );
                           })()}
