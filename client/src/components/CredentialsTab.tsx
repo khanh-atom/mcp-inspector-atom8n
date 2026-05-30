@@ -970,7 +970,6 @@ const CredentialsTab = ({
           transportType: "streamable-http",
           credentialFile: entry.sourceFile,
           credentialKey: entry.key,
-          credentialFolder: credentialsFolderPath || "",
         });
         const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
         // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"
@@ -1271,7 +1270,6 @@ const CredentialsTab = ({
       transportType: "streamable-http",
       credentialFile: proxyEntry.sourceFile,
       credentialKey: proxyEntry.key,
-      credentialFolder: credentialsFolderPath || "",
     });
     const proxyUrl = `${proxyBaseUrl}/mcp?${proxyParams.toString()}`;
     // [PROXY] Antigravity/Gemini CLI uses "serverUrl" key; others (Cursor) use "url"

@@ -476,12 +476,11 @@ const createTransport = async (
     if (!headers["Authorization"] && !headers["authorization"]) {
       const credentialFile = query.credentialFile as string | undefined;
       const credentialKey = query.credentialKey as string | undefined;
-      const credentialFolder = query.credentialFolder as string | undefined;
 
       // [PROXY] Prefer direct credential lookup by identity (from Install)
       if (credentialFile && credentialKey) {
         const meta: CredentialMeta = {
-          folderPath: credentialFolder || "./data",
+          folderPath: activeCredentialsFolderPath || DEFAULT_CREDENTIALS_FOLDER,
           sourceFile: credentialFile,
           credentialKey: credentialKey,
         };
