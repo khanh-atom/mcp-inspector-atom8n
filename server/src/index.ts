@@ -2107,43 +2107,63 @@ async function createExecuteToolConnection(
   return { client, transport };
 }
 
+function executeToolScopedCacheKey(
+  cacheKey: string,
+  accessToken?: string,
+): string {
+  return accessToken ? `${cacheKey}:credentialed` : `${cacheKey}:anonymous`;
+}
+
 async function getOrCreateExecuteToolConnection(
   cacheKey: string,
   serverConfig: Record<string, unknown>,
   req: express.Request,
   accessToken?: string,
 ): Promise<CachedExecuteToolConnection> {
+  const scopedCacheKey = executeToolScopedCacheKey(cacheKey, accessToken);
+
   // [CREDENTIALS] When an access token is provided, skip the cache to ensure fresh headers
   if (accessToken) {
     logger.info(
-      `[execute-tool:credentials] Bypassing cache for cacheKey='${cacheKey}' (credential token provided)`,
+      `[execute-tool:credentials] Bypassing credentialed cache for cacheKey='${cacheKey}' (credential token provided)`,
     );
-    await evictExecuteToolConnection(cacheKey);
-    const conn = await createExecuteToolConnection(
-      serverConfig,
-      req,
-      accessToken,
-    );
-    executeToolConnectionCache.set(cacheKey, conn);
-    return conn;
+    await evictExecuteToolConnection(scopedCacheKey);
+    const promise = createExecuteToolConnection(serverConfig, req, accessToken);
+    executeToolConnectionCache.set(scopedCacheKey, promise);
+    try {
+      const result = await promise;
+      if (executeToolConnectionCache.get(scopedCacheKey) === promise) {
+        executeToolConnectionCache.set(scopedCacheKey, result);
+      }
+      return result;
+    } catch (err) {
+      if (executeToolConnectionCache.get(scopedCacheKey) === promise) {
+        executeToolConnectionCache.delete(scopedCacheKey);
+      }
+      throw err;
+    }
   }
-  const entry = executeToolConnectionCache.get(cacheKey);
+  const entry = executeToolConnectionCache.get(scopedCacheKey);
   if (entry && "client" in entry) return entry;
   if (entry instanceof Promise) {
     try {
       return await entry;
     } catch {
-      executeToolConnectionCache.delete(cacheKey);
+      executeToolConnectionCache.delete(scopedCacheKey);
     }
   }
   const promise = createExecuteToolConnection(serverConfig, req);
-  executeToolConnectionCache.set(cacheKey, promise);
+  executeToolConnectionCache.set(scopedCacheKey, promise);
   try {
     const result = await promise;
-    executeToolConnectionCache.set(cacheKey, result);
+    if (executeToolConnectionCache.get(scopedCacheKey) === promise) {
+      executeToolConnectionCache.set(scopedCacheKey, result);
+    }
     return result;
   } catch (err) {
-    executeToolConnectionCache.delete(cacheKey);
+    if (executeToolConnectionCache.get(scopedCacheKey) === promise) {
+      executeToolConnectionCache.delete(scopedCacheKey);
+    }
     throw err;
   }
 }
@@ -2159,6 +2179,27 @@ async function evictExecuteToolConnection(cacheKey: string): Promise<void> {
       console.warn("Error during execute-tool cache eviction:", cleanupError);
     }
   }
+}
+
+async function evictAllExecuteToolConnections(reason: string): Promise<void> {
+  const cacheKeys = [...executeToolConnectionCache.keys()];
+  if (cacheKeys.length === 0) return;
+
+  logger.info(
+    `[execute-tool:cache] Evicting ${cacheKeys.length} cached connection(s): ${reason}`,
+  );
+  await Promise.all(
+    cacheKeys.map((cacheKey) => evictExecuteToolConnection(cacheKey)),
+  );
+}
+
+async function evictExecuteToolConnectionVariants(
+  cacheKey: string,
+): Promise<void> {
+  await Promise.all([
+    evictExecuteToolConnection(executeToolScopedCacheKey(cacheKey)),
+    evictExecuteToolConnection(executeToolScopedCacheKey(cacheKey, "token")),
+  ]);
 }
 
 // New endpoint for on-demand tool execution (connections cached by serverName)
@@ -2338,6 +2379,7 @@ app.post(
       }
 
       const runTool = async (accessToken?: string) => {
+        const scopedCacheKey = executeToolScopedCacheKey(cacheKey, accessToken);
         try {
           const { client } = await getOrCreateExecuteToolConnection(
             cacheKey,
@@ -2351,9 +2393,9 @@ app.post(
           });
         } catch (toolError) {
           logger.warn(
-            `[execute-tool] Tool '${toolName}' failed; evicting cache key '${cacheKey}'`,
+            `[execute-tool] Tool '${toolName}' failed; evicting cache key '${scopedCacheKey}'`,
           );
-          await evictExecuteToolConnection(cacheKey);
+          await evictExecuteToolConnection(scopedCacheKey);
           throw toolError;
         }
       };
@@ -2409,7 +2451,7 @@ app.post(
               `[execute-tool:401-retry] Token refresh or retry failed:`,
               refreshError,
             );
-            await evictExecuteToolConnection(cacheKey);
+            await evictExecuteToolConnectionVariants(cacheKey);
             throw refreshError;
           }
         }
@@ -3081,6 +3123,84 @@ app.put(
   },
 );
 
+// PATCH /credentials/name — Rename one credential entry within its source file
+app.patch(
+  "/credentials/name",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const {
+        folderPath: rawFolder,
+        sourceFile,
+        credentialKey,
+        serverName,
+      } = req.body;
+      const folderPath = typeof rawFolder === "string" ? rawFolder : "";
+      const credentialSourceFile =
+        typeof sourceFile === "string" ? sourceFile : "";
+      const key = typeof credentialKey === "string" ? credentialKey : "";
+      const nextServerName =
+        typeof serverName === "string" ? serverName.trim() : "";
+
+      if (!folderPath || !credentialSourceFile || !key || !nextServerName) {
+        logger.warn(
+          "[credentials:name] Missing 'folderPath', 'sourceFile', 'credentialKey', or 'serverName'",
+        );
+        res.status(400).json({
+          error: "Bad Request",
+          message:
+            "'folderPath', 'sourceFile', 'credentialKey', and a non-empty 'serverName' are all required",
+        });
+        return;
+      }
+
+      const meta: CredentialMeta = {
+        folderPath,
+        sourceFile: credentialSourceFile,
+        credentialKey: key,
+      };
+      const filePath = credentialFilePath(meta);
+      const credentials = await readCredentialFile(meta);
+      const credential = credentials[key];
+      if (!credential) {
+        res.status(404).json({
+          error: "Not Found",
+          message: `Credential key '${key}' not found in ${credentialSourceFile}`,
+        });
+        return;
+      }
+
+      credentials[key] = {
+        ...credential,
+        server_name: nextServerName,
+      };
+      await fs.writeFile(
+        filePath,
+        JSON.stringify(credentials, null, 4),
+        "utf8",
+      );
+
+      logger.info(
+        `[credentials:name] Renamed credential '${key}' in ${credentialSourceFile} to '${nextServerName}'`,
+      );
+      res.json({
+        success: true,
+        credentialKey: key,
+        sourceFile: credentialSourceFile,
+        serverName: nextServerName,
+      });
+    } catch (error: any) {
+      logger.error(`[credentials:name] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
 // PUT /credentials/enabled — Persist enabled credential keys for server-side lookup
 app.put(
   "/credentials/enabled",
@@ -3110,6 +3230,7 @@ app.put(
         "PUT /credentials/enabled",
       );
       await writePersistedEnabledCredentialKeys(effectiveFolderPath, keys);
+      await evictAllExecuteToolConnections("enabled credential set changed");
 
       res.json({
         success: true,

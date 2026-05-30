@@ -13,11 +13,13 @@ import { TabsContent } from "@/components/ui/tabs";
 import {
   Dialog,
   DialogContent,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogDescription,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import {
   Shield,
   Upload,
@@ -34,6 +36,7 @@ import {
   Copy,
   Info,
   Zap,
+  Pencil,
 } from "lucide-react";
 import { useToast } from "../lib/hooks/useToast";
 import { InspectorConfig } from "@/lib/configurationTypes";
@@ -68,6 +71,12 @@ interface RawCredentials {
   };
 }
 
+interface CredentialTestServerConfig {
+  type: "streamable-http";
+  url: string;
+  bearerToken?: string;
+}
+
 interface CredentialsTabProps {
   config: InspectorConfig;
   credentialsFolderPath: string;
@@ -76,7 +85,9 @@ interface CredentialsTabProps {
   setEnabledCredentials: (keys: Set<string>) => void;
   rawCredentials: RawCredentials | null;
   setRawCredentials: (creds: RawCredentials | null) => void;
-  onTestConnection?: (serverConfig: any) => void;
+  onTestConnection?: (
+    serverConfig: CredentialTestServerConfig,
+  ) => void | Promise<void>;
 }
 
 /** Format milliseconds as a human-readable duration */
@@ -107,6 +118,11 @@ const CredentialsTab = ({
   const [entries, setEntries] = useState<CredentialEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [refreshingKey, setRefreshingKey] = useState<string | null>(null);
+  const [editingEntry, setEditingEntry] = useState<CredentialEntry | null>(
+    null,
+  );
+  const [credentialNameDraft, setCredentialNameDraft] = useState("");
+  const [isSavingCredentialName, setIsSavingCredentialName] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCounterRef = useRef(0);
   const { toast } = useToast();
@@ -664,6 +680,120 @@ const CredentialsTab = ({
     ],
   );
 
+  const closeCredentialNameDialog = useCallback(() => {
+    setEditingEntry(null);
+    setCredentialNameDraft("");
+  }, []);
+
+  const handleOpenCredentialNameDialog = useCallback(
+    (entry: CredentialEntry) => {
+      setEditingEntry(entry);
+      setCredentialNameDraft(entry.serverName);
+    },
+    [],
+  );
+
+  const handleCredentialNameDialogOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open && !isSavingCredentialName) {
+        closeCredentialNameDialog();
+      }
+    },
+    [closeCredentialNameDialog, isSavingCredentialName],
+  );
+
+  const handleSaveCredentialName = useCallback(async () => {
+    if (!editingEntry || !credentialsFolderPath) return;
+
+    const nextServerName = credentialNameDraft.trim();
+    if (!nextServerName) {
+      toast({
+        title: "Name Required",
+        description: "Credential name cannot be empty",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (nextServerName === editingEntry.serverName) {
+      closeCredentialNameDialog();
+      return;
+    }
+
+    setIsSavingCredentialName(true);
+    try {
+      const baseUrl = getMCPProxyAddress(config);
+      const { token, header } = getMCPProxyAuthToken(config);
+      const resp = await fetch(`${baseUrl}/credentials/name`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          [header]: token ? `Bearer ${token}` : "",
+        },
+        body: JSON.stringify({
+          folderPath: credentialsFolderPath,
+          sourceFile: editingEntry.sourceFile,
+          credentialKey: editingEntry.key,
+          serverName: nextServerName,
+        }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        console.error("[CredentialsTab] Credential rename failed:", err);
+        toast({
+          title: "Rename Failed",
+          description:
+            err.message || `Failed to rename credential (${resp.status})`,
+          variant: "destructive",
+        });
+        return;
+      }
+
+      setEntries((currentEntries) =>
+        currentEntries.map((entry) =>
+          entry.key === editingEntry.key &&
+          entry.sourceFile === editingEntry.sourceFile
+            ? { ...entry, serverName: nextServerName }
+            : entry,
+        ),
+      );
+      if (rawCredentials?.[editingEntry.key]) {
+        setRawCredentials({
+          ...rawCredentials,
+          [editingEntry.key]: {
+            ...rawCredentials[editingEntry.key],
+            server_name: nextServerName,
+          },
+        });
+      }
+
+      toast({
+        title: "Credential Renamed",
+        description: `Updated name to ${nextServerName}`,
+      });
+      closeCredentialNameDialog();
+    } catch (error) {
+      console.error("[CredentialsTab] Error renaming credential:", error);
+      toast({
+        title: "Error",
+        description: `Failed to rename credential: ${error instanceof Error ? error.message : String(error)}`,
+        variant: "destructive",
+      });
+    } finally {
+      setIsSavingCredentialName(false);
+    }
+  }, [
+    closeCredentialNameDialog,
+    config,
+    credentialNameDraft,
+    credentialsFolderPath,
+    editingEntry,
+    rawCredentials,
+    setRawCredentials,
+    toast,
+  ]);
+
   // Compute expiry status for a credential
   const getExpiryStatus = (
     entry: CredentialEntry,
@@ -869,9 +999,23 @@ const CredentialsTab = ({
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-3">
                             <Server className="w-5 h-5 text-muted-foreground" />
-                            <div>
-                              <CardTitle className="text-base">
-                                {entry.serverName}
+                            <div className="min-w-0">
+                              <CardTitle className="flex items-center gap-1.5 text-base">
+                                <span className="truncate">
+                                  {entry.serverName}
+                                </span>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-6 w-6 shrink-0"
+                                  onClick={() =>
+                                    handleOpenCredentialNameDialog(entry)
+                                  }
+                                  title="Edit credential name"
+                                  aria-label={`Edit ${entry.serverName} credential name`}
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </Button>
                               </CardTitle>
                               <CardDescription className="flex items-center gap-1.5 mt-0.5">
                                 <Globe className="w-3 h-3" />
@@ -1151,6 +1295,65 @@ const CredentialsTab = ({
             </CardContent>
           </Card>
         )}
+
+        <Dialog
+          open={!!editingEntry}
+          onOpenChange={handleCredentialNameDialogOpenChange}
+        >
+          <DialogContent className="max-w-md">
+            <form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleSaveCredentialName();
+              }}
+            >
+              <DialogHeader>
+                <DialogTitle>Edit Credential Name</DialogTitle>
+                <DialogDescription>
+                  Update the display name stored in the credential file.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-2">
+                <Input
+                  value={credentialNameDraft}
+                  onChange={(event) =>
+                    setCredentialNameDraft(event.target.value)
+                  }
+                  placeholder="Credential name"
+                  autoFocus
+                  disabled={isSavingCredentialName}
+                />
+                {editingEntry && (
+                  <p className="text-xs text-muted-foreground">
+                    {editingEntry.sourceFile}
+                  </p>
+                )}
+              </div>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={closeCredentialNameDialog}
+                  disabled={isSavingCredentialName}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={
+                    isSavingCredentialName || !credentialNameDraft.trim()
+                  }
+                >
+                  {isSavingCredentialName && (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  )}
+                  Save
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
       </div>
     </TabsContent>
   );
