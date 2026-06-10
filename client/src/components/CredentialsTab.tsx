@@ -197,6 +197,8 @@ const CredentialsTab = ({
   const [credentialNameDraft, setCredentialNameDraft] = useState("");
   const [isSavingCredentialName, setIsSavingCredentialName] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isEditingFolderPath, setIsEditingFolderPath] = useState(false);
+  const [folderPathDraft, setFolderPathDraft] = useState("");
   const dragCounterRef = useRef(0);
   const { toast } = useToast();
 
@@ -410,6 +412,21 @@ const CredentialsTab = ({
       });
     }
   }, [config, setCredentialsFolderPath, loadCredentials, toast]);
+
+  // Handle manual folder path submission
+  const handleManualFolderPath = useCallback(
+    (path: string) => {
+      const trimmed = path.trim();
+      if (!trimmed) return;
+      console.log("[CredentialsTab] Manual folder path entered:", trimmed);
+      setCredentialsFolderPath(trimmed);
+      localStorage.setItem("credentialsFolderPath", trimmed);
+      setIsEditingFolderPath(false);
+      setFolderPathDraft("");
+      loadCredentials(trimmed);
+    },
+    [setCredentialsFolderPath, loadCredentials],
+  );
 
   // [DRAG-DROP] Handle file drop — read content and upload to server into the selected folder
   const handleFileDrop = useCallback(
@@ -1644,9 +1661,22 @@ const CredentialsTab = ({
           </div>
         </div>
 
-        {/* Folder path display */}
-        {credentialsFolderPath && (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground px-1">
+        {/* Folder path display / edit */}
+        {credentialsFolderPath && !isEditingFolderPath && (
+          <div className="flex items-center gap-1.5 text-sm text-muted-foreground px-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="w-6 h-6 shrink-0"
+              onClick={() => {
+                setFolderPathDraft(credentialsFolderPath);
+                setIsEditingFolderPath(true);
+              }}
+              disabled={isLoading}
+              title="Edit folder path manually"
+            >
+              <Pencil className="w-3 h-3" />
+            </Button>
             <FolderOpen className="w-3.5 h-3.5 shrink-0" />
             <span className="truncate">{credentialsFolderPath}</span>
             {Object.keys(entriesByFile).length > 0 && (
@@ -1654,6 +1684,45 @@ const CredentialsTab = ({
                 {Object.keys(entriesByFile).length} file(s)
               </Badge>
             )}
+          </div>
+        )}
+        {isEditingFolderPath && (
+          <div className="flex items-center gap-2 px-1">
+            <FolderOpen className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+            <Input
+              value={folderPathDraft}
+              onChange={(e) => setFolderPathDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  handleManualFolderPath(folderPathDraft);
+                } else if (e.key === "Escape") {
+                  setIsEditingFolderPath(false);
+                  setFolderPathDraft("");
+                }
+              }}
+              placeholder="Enter folder path (e.g. /path/to/credentials)"
+              className="h-8 text-sm flex-1"
+              autoFocus
+            />
+            <Button
+              variant="default"
+              size="sm"
+              onClick={() => handleManualFolderPath(folderPathDraft)}
+              disabled={!folderPathDraft.trim()}
+            >
+              <CheckCircle2 className="w-4 h-4 mr-1" />
+              Apply
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setIsEditingFolderPath(false);
+                setFolderPathDraft("");
+              }}
+            >
+              <XCircle className="w-4 h-4" />
+            </Button>
           </div>
         )}
 
@@ -1691,14 +1760,38 @@ const CredentialsTab = ({
                     source.
                   </p>
                 </div>
-                <div className="flex items-center gap-3">
-                  <Button variant="default" onClick={handleChooseFolder}>
-                    <FolderOpen className="w-4 h-4 mr-2" />
-                    Choose Folder
-                  </Button>
-                  <span className="text-sm text-muted-foreground">or</span>
-                  <div className="border-2 border-dashed border-muted-foreground/30 rounded-lg px-4 py-2 text-sm text-muted-foreground">
-                    Drag & drop .json files here
+                <div className="flex flex-col items-center gap-3 w-full max-w-lg">
+                  <div className="flex items-center gap-3">
+                    <Button variant="default" onClick={handleChooseFolder}>
+                      <FolderOpen className="w-4 h-4 mr-2" />
+                      Choose Folder
+                    </Button>
+                    <span className="text-sm text-muted-foreground">or</span>
+                    <div className="border-2 border-dashed border-muted-foreground/30 rounded-lg px-4 py-2 text-sm text-muted-foreground">
+                      Drag & drop .json files here
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 w-full mt-1">
+                    <Input
+                      value={folderPathDraft}
+                      onChange={(e) => setFolderPathDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          handleManualFolderPath(folderPathDraft);
+                        }
+                      }}
+                      placeholder="Or enter folder path manually..."
+                      className="h-8 text-sm flex-1"
+                    />
+                    <Button
+                      variant="default"
+                      size="sm"
+                      onClick={() => handleManualFolderPath(folderPathDraft)}
+                      disabled={!folderPathDraft.trim()}
+                    >
+                      <CheckCircle2 className="w-4 h-4 mr-1" />
+                      Load
+                    </Button>
                   </div>
                 </div>
               </div>
