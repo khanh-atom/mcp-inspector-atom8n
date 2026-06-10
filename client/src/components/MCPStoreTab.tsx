@@ -58,6 +58,10 @@ interface MCPServer {
   author?: string;
   license?: string;
   source?: string;
+  /** The original config key used in the MCP config file */
+  _configKey?: string;
+  /** Raw config object for proxy/credential servers (serverUrl/url/type based) */
+  _rawConfig?: Record<string, unknown>;
 }
 
 interface MCPSourceResponse {
@@ -65,11 +69,15 @@ interface MCPSourceResponse {
 }
 
 interface ServerConfig {
-  command: string;
-  args: string[];
+  command?: string;
+  args?: string[];
   env?: Record<string, string>;
   disabled?: boolean;
   autoApprove?: string[];
+  serverUrl?: string;
+  url?: string;
+  type?: string;
+  [key: string]: unknown;
 }
 
 interface MCPStoreTabProps {
@@ -360,6 +368,9 @@ const MCPStoreTab = ({
               });
             }
           } else {
+            // Detect proxy/credential servers (serverUrl or url key, no command)
+            const isProxy =
+              !serverCfg.command && (serverCfg.serverUrl || serverCfg.url);
             result.push({
               name,
               command: serverCfg.command || "",
@@ -367,11 +378,19 @@ const MCPStoreTab = ({
               env: serverCfg.env || {},
               disabled: serverCfg.disabled || false,
               autoApprove: serverCfg.autoApprove || [],
-              description: serverCfg.description,
+              description:
+                serverCfg.description ||
+                (isProxy
+                  ? `Proxy: ${serverCfg.serverUrl || serverCfg.url}`
+                  : undefined),
               version: serverCfg.version,
               author: serverCfg.author,
               license: serverCfg.license,
               source: sourceName,
+              _configKey: name,
+              // Preserve raw config for proxy servers so install/uninstall
+              // can write back the original shape (serverUrl, url, type, etc.)
+              ...(isProxy ? { _rawConfig: { ...serverCfg } } : {}),
             });
           }
         }
@@ -558,6 +577,12 @@ const MCPStoreTab = ({
     );
   };
 
+  /** Detect proxy/credential-based servers (have serverUrl/url instead of command). */
+  const isProxyServer = (server: MCPServer): boolean =>
+    !!server._rawConfig &&
+    !server.command &&
+    !!(server._rawConfig.serverUrl || server._rawConfig.url);
+
   /** Detect n8n workflow items from any source (n8n workflows or expanded config). */
   const isN8nWorkflow = (server: MCPServer): boolean =>
     server.source === "Workspace" ||
@@ -715,15 +740,36 @@ const MCPStoreTab = ({
       );
       return installed;
     }
+    // Proxy/credential servers: match by config key (exact name in config)
+    if (isProxyServer(server)) {
+      const configKey = server._configKey || server.name;
+      const installed = configKey in currentServers;
+      console.log(
+        "[MCPStore:proxy] isServerInstalled",
+        server.name,
+        "configKey:",
+        configKey,
+        "installed:",
+        installed,
+      );
+      return installed;
+    }
     // Check by name: if the server name is a key in currentServers, it's installed
     if (server.name in currentServers) {
+      return true;
+    }
+    // Also check by _configKey if available
+    if (server._configKey && server._configKey in currentServers) {
       return true;
     }
     // Fall back to matching by command + args (for servers from external sources)
     return Object.values(currentServers).some(
       (existingServer: ServerConfig) => {
         // Check if command and args match
-        if (existingServer.command === server.command) {
+        if (
+          existingServer.command &&
+          existingServer.command === server.command
+        ) {
           const existingArgs = Array.isArray(existingServer.args)
             ? existingServer.args
             : [];
@@ -782,10 +828,23 @@ const MCPStoreTab = ({
           },
         };
         console.log("[MCPStore:n8n] Updated n8n-workflow-mcp args:", newArgs);
+      } else if (isProxyServer(server)) {
+        // Proxy/credential server install — write back the original config shape
+        const configKey = server._configKey || server.name;
+        const rawConfig = server._rawConfig || {};
+        console.log("[MCPStore:proxy] Installing proxy server", {
+          configKey,
+          rawConfig,
+        });
+
+        updatedServers = {
+          ...currentServers,
+          [configKey]: rawConfig as ServerConfig,
+        };
       } else {
         // Standard server install
         // Generate the server configuration
-        const serverConfig = {
+        const serverConfig: ServerConfig = {
           command: server.command,
           args: server.args,
           env: server.env,
@@ -974,20 +1033,43 @@ const MCPStoreTab = ({
           serverName = undefined;
           updatedServers = { ...currentServers };
         }
+      } else if (isProxyServer(server)) {
+        // Proxy/credential server uninstall — match by config key
+        serverName = server._configKey || server.name;
+        console.log(
+          "[MCPStore:proxy] Uninstalling proxy server, configKey:",
+          serverName,
+        );
+        updatedServers = { ...currentServers };
+        if (serverName && serverName in updatedServers) {
+          delete updatedServers[serverName];
+        } else {
+          serverName = undefined;
+        }
       } else {
         // Standard server uninstall
-        // Find the server name in current configuration
-        serverName = Object.keys(currentServers).find((name) => {
-          const existingServer = currentServers[name];
-          if (existingServer.command === server.command) {
-            const existingArgs = Array.isArray(existingServer.args)
-              ? existingServer.args
-              : [];
-            const serverArgs = Array.isArray(server.args) ? server.args : [];
-            return JSON.stringify(existingArgs) === JSON.stringify(serverArgs);
-          }
-          return false;
-        });
+        // Find the server name in current configuration — first try _configKey, then name, then command+args match
+        serverName =
+          (server._configKey && server._configKey in currentServers
+            ? server._configKey
+            : undefined) ||
+          (server.name in currentServers ? server.name : undefined) ||
+          Object.keys(currentServers).find((name) => {
+            const existingServer = currentServers[name];
+            if (
+              existingServer.command &&
+              existingServer.command === server.command
+            ) {
+              const existingArgs = Array.isArray(existingServer.args)
+                ? existingServer.args
+                : [];
+              const serverArgs = Array.isArray(server.args) ? server.args : [];
+              return (
+                JSON.stringify(existingArgs) === JSON.stringify(serverArgs)
+              );
+            }
+            return false;
+          });
 
         // Generate configuration without this server
         updatedServers = { ...currentServers };
@@ -1136,27 +1218,38 @@ const MCPStoreTab = ({
         );
       }
 
-      // Handle standard servers
+      // Handle standard and proxy servers
       for (const server of standardServers) {
-        const serverConfig = {
-          command: server.command,
-          args: server.args,
-          env: server.env,
-          disabled: server.disabled,
-          autoApprove: server.autoApprove,
-        };
-        const serverName = server.name
-          .toLowerCase()
-          .replace(/[^a-z0-9-]/g, "-");
-        const finalName = Object.keys(updatedServers).includes(serverName)
-          ? `${serverName}-${Date.now()}`
-          : serverName;
-        updatedServers[finalName] = serverConfig;
-        console.log(
-          "[MCPStore:batch] Added standard server:",
-          finalName,
-          serverConfig,
-        );
+        if (isProxyServer(server)) {
+          // Proxy/credential server — use original config key and raw config
+          const configKey = server._configKey || server.name;
+          updatedServers[configKey] = (server._rawConfig as ServerConfig) || {};
+          console.log(
+            "[MCPStore:batch] Added proxy server:",
+            configKey,
+            server._rawConfig,
+          );
+        } else {
+          const serverConfig: ServerConfig = {
+            command: server.command,
+            args: server.args,
+            env: server.env,
+            disabled: server.disabled,
+            autoApprove: server.autoApprove,
+          };
+          const serverName = server.name
+            .toLowerCase()
+            .replace(/[^a-z0-9-]/g, "-");
+          const finalName = Object.keys(updatedServers).includes(serverName)
+            ? `${serverName}-${Date.now()}`
+            : serverName;
+          updatedServers[finalName] = serverConfig;
+          console.log(
+            "[MCPStore:batch] Added standard server:",
+            finalName,
+            serverConfig,
+          );
+        }
       }
 
       const baseUrl = getMCPProxyAddress(config);
@@ -1276,22 +1369,40 @@ const MCPStoreTab = ({
         }
       }
 
-      // Handle standard servers
+      // Handle standard and proxy servers
       for (const server of standardServers) {
-        const matchedName = Object.keys(updatedServers).find((name) => {
-          const existing = updatedServers[name];
-          if (existing.command === server.command) {
-            const existingArgs = Array.isArray(existing.args)
-              ? existing.args
-              : [];
-            const serverArgs = Array.isArray(server.args) ? server.args : [];
-            return JSON.stringify(existingArgs) === JSON.stringify(serverArgs);
+        let matchedName: string | undefined;
+        if (isProxyServer(server)) {
+          // Proxy servers: match by config key
+          const configKey = server._configKey || server.name;
+          if (configKey in updatedServers) {
+            matchedName = configKey;
           }
-          return false;
-        });
+        } else {
+          matchedName =
+            (server._configKey && server._configKey in updatedServers
+              ? server._configKey
+              : undefined) ||
+            (server.name in updatedServers ? server.name : undefined) ||
+            Object.keys(updatedServers).find((name) => {
+              const existing = updatedServers[name];
+              if (existing.command && existing.command === server.command) {
+                const existingArgs = Array.isArray(existing.args)
+                  ? existing.args
+                  : [];
+                const serverArgs = Array.isArray(server.args)
+                  ? server.args
+                  : [];
+                return (
+                  JSON.stringify(existingArgs) === JSON.stringify(serverArgs)
+                );
+              }
+              return false;
+            });
+        }
         if (matchedName) {
           delete updatedServers[matchedName];
-          console.log("[MCPStore:batch] Removed standard server:", matchedName);
+          console.log("[MCPStore:batch] Removed server:", matchedName);
         }
       }
 
@@ -1762,14 +1873,16 @@ const MCPStoreTab = ({
                               variant="outline"
                               size="sm"
                               onClick={() => {
-                                const config = {
-                                  command: server.command,
-                                  args: server.args,
-                                  env: server.env,
-                                  disabled: server.disabled,
-                                  autoApprove: server.autoApprove,
-                                };
-                                console.log("Server config:", config);
+                                const cfg = isProxyServer(server)
+                                  ? server._rawConfig || {}
+                                  : {
+                                      command: server.command,
+                                      args: server.args,
+                                      env: server.env,
+                                      disabled: server.disabled,
+                                      autoApprove: server.autoApprove,
+                                    };
+                                console.log("Server config:", cfg);
                               }}
                               title="View server configuration"
                             >
