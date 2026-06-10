@@ -503,7 +503,11 @@ const createTransport = async (
   req: express.Request,
 ): Promise<{
   transport: Transport;
-  headerHolder?: { headers: HeadersInit; preserveAuthorization?: boolean };
+  headerHolder?: {
+    headers: HeadersInit;
+    preserveAuthorization?: boolean;
+    refreshAuthorization?: (error: unknown) => Promise<boolean>;
+  };
 }> => {
   const query = req.query;
   logger.info("Query parameters:", JSON.stringify(query));
@@ -512,6 +516,7 @@ const createTransport = async (
   let upstreamUrl = getQueryString(query.url);
   const credentialFile = getQueryString(query.credentialFile);
   const credentialKey = getQueryString(query.credentialKey);
+  let credentialMetaForRefresh: CredentialMeta | undefined;
 
   // [PROXY] When credentialFile+credentialKey are provided but url is not,
   // derive the upstream URL from the credential's server_url and default to streamable-http.
@@ -527,6 +532,7 @@ const createTransport = async (
       sourceFile: credentialFile,
       credentialKey: credentialKey,
     };
+    credentialMetaForRefresh = meta;
     console.log(
       `[createTransport:proxy] No url — deriving from credential: ${credentialFile}/${credentialKey}`,
     );
@@ -620,38 +626,21 @@ const createTransport = async (
         sourceFile: credentialFile,
         credentialKey: credentialKey,
       };
+      credentialMetaForRefresh = meta;
       console.log(
         `[createTransport:proxy] Direct credential lookup: ${credentialFile}/${credentialKey} in folder: ${effectiveFolder}`,
       );
       try {
-        const located = await readCredentialByMeta(meta);
-        const safetyMarginMs = 60_000;
-        if (
-          located.credential.expires_at &&
-          located.credential.expires_at <= Date.now() + safetyMarginMs
-        ) {
-          console.log(
-            "[createTransport:proxy] Token expired or expiring, refreshing...",
-          );
-          try {
-            const refreshResult = await refreshCredentialToken(meta);
-            headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
-            console.log("[createTransport:proxy] Injected refreshed token");
-          } catch (refreshErr) {
-            headers["Authorization"] =
-              `Bearer ${located.credential.access_token}`;
-            console.warn(
-              "[createTransport:proxy] Refresh failed, using existing token:",
-              refreshErr,
-            );
-          }
-        } else {
-          headers["Authorization"] =
-            `Bearer ${located.credential.access_token}`;
-          console.log(
-            "[createTransport:proxy] Injected token from direct credential lookup",
-          );
-        }
+        const tokenResult = await getValidCredentialAccessToken(
+          meta,
+          "proxy connect direct credential lookup",
+        );
+        headers["Authorization"] = `Bearer ${tokenResult.accessToken}`;
+        console.log(
+          tokenResult.refreshed
+            ? "[createTransport:proxy] Injected refreshed token from direct credential lookup"
+            : "[createTransport:proxy] Injected token from direct credential lookup",
+        );
         credentialInjected = true;
       } catch (error) {
         console.warn(
@@ -674,35 +663,19 @@ const createTransport = async (
       );
       try {
         const located = await findCredentialForServerUrl(url.toString());
-        if (located?.credential.access_token) {
-          const safetyMarginMs = 60_000;
-          if (
-            located.credential.expires_at &&
-            located.credential.expires_at <= Date.now() + safetyMarginMs &&
-            located.meta
-          ) {
-            console.log(
-              "[createTransport:proxy] Token expired or expiring, refreshing...",
-            );
-            try {
-              const refreshResult = await refreshCredentialToken(located.meta);
-              headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
-              console.log("[createTransport:proxy] Injected refreshed token");
-            } catch (refreshErr) {
-              headers["Authorization"] =
-                `Bearer ${located.credential.access_token}`;
-              console.warn(
-                "[createTransport:proxy] Refresh failed, using existing token:",
-                refreshErr,
-              );
-            }
-          } else {
-            headers["Authorization"] =
-              `Bearer ${located.credential.access_token}`;
-            console.log(
-              "[createTransport:proxy] Injected credential from URL search",
-            );
-          }
+        if (located?.meta) {
+          credentialMetaForRefresh = located.meta;
+          const tokenResult = await getValidCredentialAccessToken(
+            located.meta,
+            "proxy connect URL credential lookup",
+          );
+          headers["Authorization"] = `Bearer ${tokenResult.accessToken}`;
+          credentialInjected = true;
+          console.log(
+            tokenResult.refreshed
+              ? "[createTransport:proxy] Injected refreshed credential from URL search"
+              : "[createTransport:proxy] Injected credential from URL search",
+          );
         } else {
           console.log(
             "[createTransport:proxy] No matching credential found for upstream URL",
@@ -723,6 +696,25 @@ const createTransport = async (
     const headerHolder = {
       headers,
       preserveAuthorization: credentialInjected,
+      refreshAuthorization: credentialMetaForRefresh
+        ? async (error: unknown) => {
+            if (!isRefreshableAuthError(error)) {
+              return false;
+            }
+
+            logger.info(
+              "[createTransport:proxy] Upstream auth failure detected; refreshing credential token and retrying once",
+            );
+            const refreshResult = await getValidCredentialAccessToken(
+              credentialMetaForRefresh!,
+              "proxy upstream auth failure",
+              true,
+            );
+            headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
+            delete headers["authorization"];
+            return true;
+          }
+        : undefined,
     };
 
     const transport = new StreamableHTTPClientTransport(url, {
@@ -887,6 +879,7 @@ app.post(
           transportToClient: webAppTransport,
           transportToServer: serverTransport,
           allowedTools: allowedToolsSet,
+          onServerSendAuthError: headerHolder?.refreshAuthorization,
         });
 
         await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
@@ -2540,11 +2533,77 @@ async function refreshCredentialToken(
   };
 }
 
+const CREDENTIAL_TOKEN_REFRESH_MARGIN_MS = 60_000;
+
 /** Check whether an error message indicates a 401 Unauthorized from the upstream server */
 function isUnauthorizedError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
   // Match patterns like "HTTP 401", "(401)", "401 Unauthorized", "Unauthorized"
   return /\b401\b/i.test(msg) || /\bUnauthorized\b/i.test(msg);
+}
+
+/** Check whether an error message indicates a 403 Forbidden from the upstream server */
+function isForbiddenError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    /\b403\b/i.test(msg) ||
+    /\bForbidden\b/i.test(msg) ||
+    /Failed permission authorization checks/i.test(msg)
+  );
+}
+
+function isRefreshableAuthError(error: unknown): boolean {
+  return isUnauthorizedError(error) || isForbiddenError(error);
+}
+
+async function getValidCredentialAccessToken(
+  meta: CredentialMeta,
+  reason: string,
+  forceRefresh = false,
+): Promise<{ accessToken: string; refreshed: boolean; expiresAt?: number }> {
+  const located = await readCredentialByMeta(meta);
+  const credential = located.credential;
+  const expiresAt =
+    typeof credential.expires_at === "number" ? credential.expires_at : null;
+  const expiresSoon =
+    expiresAt !== null &&
+    expiresAt <= Date.now() + CREDENTIAL_TOKEN_REFRESH_MARGIN_MS;
+  const shouldRefresh =
+    forceRefresh || !credential.access_token || Boolean(expiresSoon);
+
+  if (shouldRefresh) {
+    logger.info(
+      `[credentials:token] Refreshing credential '${meta.credentialKey}' for ${reason} (force=${forceRefresh}, hasAccessToken=${Boolean(credential.access_token)}, expiresAt=${
+        expiresAt ? new Date(expiresAt).toISOString() : "<unknown>"
+      })`,
+    );
+    const refreshResult = await refreshCredentialToken(meta);
+    return {
+      accessToken: refreshResult.accessToken,
+      refreshed: true,
+      expiresAt: refreshResult.expiresAt,
+    };
+  }
+
+  if (!credential.access_token) {
+    throw new Error(`Credential '${meta.credentialKey}' has no access_token`);
+  }
+
+  if (expiresAt) {
+    logger.info(
+      `[credentials:token] Existing credential token is valid until ${new Date(expiresAt).toISOString()} for ${reason}`,
+    );
+  } else {
+    logger.info(
+      `[credentials:token] Credential '${meta.credentialKey}' has no expiry metadata; using existing token for ${reason} and will refresh on auth failure`,
+    );
+  }
+
+  return {
+    accessToken: credential.access_token,
+    refreshed: false,
+    ...(expiresAt ? { expiresAt } : {}),
+  };
 }
 
 // Helpers for execute-tool connection cache
@@ -2738,6 +2797,7 @@ app.post(
     }
 
     let effectiveAccessToken = accessToken;
+    let effectiveCredentialMeta = credentialMeta;
 
     // [PROXY] Always check credentialMeta for a fresher token, even if accessToken was provided
     if (credentialMeta) {
@@ -2746,30 +2806,11 @@ app.post(
         credentialMeta,
       );
       try {
-        const located = await readCredentialByMeta(credentialMeta);
-
-        // Auto-refresh if expired (or about to expire within 60s)
-        const safetyMarginMs = 60_000;
-        if (
-          located.credential.expires_at &&
-          located.credential.expires_at <= Date.now() + safetyMarginMs
-        ) {
-          console.log(
-            "[credential-server-tools] Token expired or expiring soon, refreshing...",
-          );
-          const refreshResult = await refreshCredentialToken(credentialMeta);
-          effectiveAccessToken = refreshResult.accessToken;
-          console.log(
-            "[credential-server-tools] Token refreshed successfully, new expiry:",
-            new Date(refreshResult.expiresAt).toISOString(),
-          );
-        } else if (located.credential.access_token) {
-          // Use the on-disk token (may be newer than the one the client sent)
-          effectiveAccessToken = located.credential.access_token;
-          console.log(
-            "[credential-server-tools] Using on-disk token (not expired)",
-          );
-        }
+        const tokenResult = await getValidCredentialAccessToken(
+          credentialMeta,
+          "credential-server-tools before listTools",
+        );
+        effectiveAccessToken = tokenResult.accessToken;
       } catch (error) {
         console.warn(
           "[credential-server-tools] Failed to read/refresh credential via meta:",
@@ -2788,8 +2829,13 @@ app.post(
           serverUrl,
           credentialsFolderPath,
         );
-        if (located?.credential.access_token) {
-          effectiveAccessToken = located.credential.access_token;
+        if (located?.meta) {
+          effectiveCredentialMeta = located.meta;
+          const tokenResult = await getValidCredentialAccessToken(
+            located.meta,
+            "credential-server-tools URL lookup",
+          );
+          effectiveAccessToken = tokenResult.accessToken;
           console.log(
             "[credential-server-tools] Found credential by URL match",
           );
@@ -2809,7 +2855,7 @@ app.post(
       success: boolean;
       tools?: any[];
       error?: unknown;
-      is401?: boolean;
+      isAuthFailure?: boolean;
     }> => {
       let transport: Transport | null = null;
       let client: Client | null = null;
@@ -2851,12 +2897,12 @@ app.post(
 
         return { success: true, tools };
       } catch (error) {
-        const is401 = isUnauthorizedError(error);
+        const isAuthFailure = isRefreshableAuthError(error);
         console.error(
-          `[credential-server-tools] Error listing tools (is401=${is401}):`,
+          `[credential-server-tools] Error listing tools (isAuthFailure=${isAuthFailure}):`,
           error,
         );
-        return { success: false, error, is401 };
+        return { success: false, error, isAuthFailure };
       } finally {
         try {
           if (client) await client.close();
@@ -2874,17 +2920,23 @@ app.post(
     // [PROXY] First attempt
     let result = await attemptListTools(effectiveAccessToken);
 
-    // [PROXY] If 401 and we have credentialMeta, try refreshing token and retrying once
-    if (!result.success && result.is401 && credentialMeta) {
+    // [PROXY] If auth fails and we have credential metadata, refresh and retry once
+    if (!result.success && result.isAuthFailure && effectiveCredentialMeta) {
       console.log(
-        "[credential-server-tools] Got 401, attempting token refresh and retry...",
+        "[credential-server-tools] Got upstream auth failure, attempting token refresh and retry...",
       );
       try {
-        const refreshResult = await refreshCredentialToken(credentialMeta);
+        const refreshResult = await getValidCredentialAccessToken(
+          effectiveCredentialMeta,
+          "credential-server-tools upstream auth failure",
+          true,
+        );
         effectiveAccessToken = refreshResult.accessToken;
         console.log(
           "[credential-server-tools] Token refreshed for retry, new expiry:",
-          new Date(refreshResult.expiresAt).toISOString(),
+          refreshResult.expiresAt
+            ? new Date(refreshResult.expiresAt).toISOString()
+            : "<unknown>",
         );
 
         result = await attemptListTools(effectiveAccessToken);
@@ -3071,7 +3123,8 @@ app.post(
         }`,
       );
 
-      // [CREDENTIALS] Prefer an explicit request token, then the stored token.
+      // [CREDENTIALS] Prefer a validated on-disk credential when metadata is available,
+      // then fall back to an explicit request token or stored lookup token.
       let currentAccessToken =
         credentials?.access_token || locatedCredential?.credential.access_token;
       let tokenRefreshed = false;
@@ -3085,15 +3138,23 @@ app.post(
         }`,
       );
 
-      if (!currentAccessToken && effectiveCredentialMeta) {
-        logger.info(
-          "[execute-tool:credentials] No access token supplied; refreshing matched credential before execution",
-        );
-        const refreshResult = await refreshCredentialToken(
-          effectiveCredentialMeta,
-        );
-        currentAccessToken = refreshResult.accessToken;
-        tokenRefreshed = true;
+      if (effectiveCredentialMeta) {
+        try {
+          const tokenResult = await getValidCredentialAccessToken(
+            effectiveCredentialMeta,
+            "execute-tool before tool call",
+          );
+          currentAccessToken = tokenResult.accessToken;
+          tokenRefreshed = tokenResult.refreshed;
+        } catch (tokenError) {
+          logger.warn(
+            "[execute-tool:credentials] Failed to validate/refresh credential before execution:",
+            tokenError,
+          );
+          if (!currentAccessToken) {
+            throw tokenError;
+          }
+        }
       }
 
       const runTool = async (accessToken?: string) => {
@@ -3131,29 +3192,35 @@ app.post(
         });
         return;
       } catch (executeError) {
-        // ── Auto-refresh on 401 Unauthorized ────────────────────────────
-        // If the MCP connection or tool call failed with a 401 and we have
-        // credential metadata, refresh and retry once.
-        if (isUnauthorizedError(executeError) && effectiveCredentialMeta) {
+        // ── Auto-refresh on upstream auth failure ───────────────────────
+        // If the MCP connection or tool call failed with an auth-style error
+        // and we have credential metadata, refresh and retry once.
+        if (isRefreshableAuthError(executeError) && effectiveCredentialMeta) {
           logger.info(
-            `[execute-tool:401-retry] Detected 401 for tool '${toolName}'. Attempting token refresh via credentialMeta...`,
+            `[execute-tool:auth-retry] Detected upstream auth failure for tool '${toolName}'. Attempting token refresh via credentialMeta...`,
           );
 
           try {
-            const refreshResult = await refreshCredentialToken(
+            const refreshResult = await getValidCredentialAccessToken(
               effectiveCredentialMeta,
+              "execute-tool upstream auth failure",
+              true,
             );
             currentAccessToken = refreshResult.accessToken;
             tokenRefreshed = true;
 
             logger.info(
-              `[execute-tool:401-retry] Token refreshed successfully. New expiry: ${new Date(refreshResult.expiresAt).toISOString()}. Retrying tool call...`,
+              `[execute-tool:auth-retry] Token refreshed successfully. New expiry: ${
+                refreshResult.expiresAt
+                  ? new Date(refreshResult.expiresAt).toISOString()
+                  : "<unknown>"
+              }. Retrying tool call...`,
             );
 
             const retryResult = await runTool(currentAccessToken);
 
             logger.info(
-              `[execute-tool:401-retry] Tool '${toolName}' succeeded after token refresh`,
+              `[execute-tool:auth-retry] Tool '${toolName}' succeeded after token refresh`,
             );
             res.json({
               success: true,
@@ -3166,7 +3233,7 @@ app.post(
             return;
           } catch (refreshError) {
             logger.error(
-              `[execute-tool:401-retry] Token refresh or retry failed:`,
+              `[execute-tool:auth-retry] Token refresh or retry failed:`,
               refreshError,
             );
             await evictExecuteToolConnectionVariants(cacheKey);
@@ -3178,9 +3245,18 @@ app.post(
       }
     } catch (error) {
       logger.error("[execute-tool] Error executing tool:", error);
-      const statusCode = isUnauthorizedError(error) ? 401 : 500;
+      const statusCode = isUnauthorizedError(error)
+        ? 401
+        : isForbiddenError(error)
+          ? 403
+          : 500;
       res.status(statusCode).json({
-        error: statusCode === 401 ? "Unauthorized" : "Internal Server Error",
+        error:
+          statusCode === 401
+            ? "Unauthorized"
+            : statusCode === 403
+              ? "Forbidden"
+              : "Internal Server Error",
         message: error instanceof Error ? error.message : String(error),
         serverName,
         toolName,

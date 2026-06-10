@@ -31,6 +31,10 @@ function onServerError(error: Error) {
   }
 }
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Filter a tools/list response to only include allowed tools.
  * Returns a new message with filtered tools, or the original if not applicable.
@@ -111,11 +115,14 @@ export default function mcpProxy({
   transportToClient,
   transportToServer,
   allowedTools,
+  onServerSendAuthError,
 }: {
   transportToClient: Transport;
   transportToServer: Transport;
   /** Optional set of tool names to expose. If undefined/null, all tools pass through. */
   allowedTools?: Set<string> | null;
+  /** Optional hook to refresh upstream auth and retry one failed client->server send. */
+  onServerSendAuthError?: (error: unknown) => Promise<boolean>;
 }) {
   let transportToClientClosed = false;
   let transportToServerClosed = false;
@@ -134,7 +141,7 @@ export default function mcpProxy({
     console.log(`[mcpProxy] No tool filtering — all tools pass through`);
   }
 
-  transportToClient.onmessage = (message) => {
+  const forwardToServer = async (message: JSONRPCMessage) => {
     console.log(`[mcpProxy] Client → Server: ${summarizeMessage(message)}`);
 
     // If filtering is active, check tools/call requests
@@ -152,8 +159,32 @@ export default function mcpProxy({
       }
     }
 
-    transportToServer.send(message).catch((error) => {
-      console.error(`[mcpProxy] Failed to send to server: ${error.message}`);
+    try {
+      await transportToServer.send(message);
+    } catch (error) {
+      console.error(
+        `[mcpProxy] Failed to send to server: ${getErrorMessage(error)}`,
+      );
+
+      if (onServerSendAuthError) {
+        try {
+          const shouldRetry = await onServerSendAuthError(error);
+          if (shouldRetry && !transportToServerClosed) {
+            console.log(
+              "[mcpProxy] Retrying client message after credential refresh",
+            );
+            await transportToServer.send(message);
+            return;
+          }
+        } catch (retryError) {
+          console.error(
+            "[mcpProxy] Credential refresh retry failed:",
+            retryError,
+          );
+          error = retryError;
+        }
+      }
+
       // Send error response back to client if it was a request (has id) and connection is still open
       if (isJSONRPCRequest(message) && !transportToClientClosed) {
         const errorResponse = {
@@ -161,13 +192,17 @@ export default function mcpProxy({
           id: message.id,
           error: {
             code: -32001,
-            message: error.message,
+            message: getErrorMessage(error),
             data: error,
           },
         };
         transportToClient.send(errorResponse).catch(onClientError);
       }
-    });
+    }
+  };
+
+  transportToClient.onmessage = (message) => {
+    void forwardToServer(message);
   };
 
   transportToServer.onmessage = (message) => {
