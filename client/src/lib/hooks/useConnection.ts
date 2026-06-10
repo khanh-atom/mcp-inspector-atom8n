@@ -52,6 +52,7 @@ import {
   getMCPServerRequestMaxTotalTimeout,
   resetRequestTimeoutOnProgress,
   getMCPProxyAuthToken,
+  redactUrlForLog,
 } from "@/utils/configUtils";
 import { getMCPServerRequestTimeout } from "@/utils/configUtils";
 import { InspectorConfig } from "../configurationTypes";
@@ -376,11 +377,32 @@ export function useConnection({
     console.log(
       `[useConnection] connect() called — transportType=${transportType}, retryCount=${retryCount}, connectionType=${connectionType}`,
     );
-    console.log(
-      `[useConnection] params — command="${command}", args="${args}", sseUrl="${sseUrl}"`,
-    );
+    console.log("[useConnection] params", {
+      command,
+      args,
+      serverUrl: redactUrlForLog(sseUrl),
+      serverUrlLength: sseUrl.length,
+      trimmedServerUrlLength: sseUrl.trim().length,
+    });
     console.trace("[useConnection] connect() call stack");
     setConnectionStatus("connecting");
+
+    const trimmedSseUrl = sseUrl.trim();
+    if (transportType !== "stdio" && !trimmedSseUrl) {
+      console.warn("[useConnection] Missing server URL before connect", {
+        transportType,
+        connectionType,
+        rawServerUrlLength: sseUrl.length,
+        trimmedServerUrlLength: trimmedSseUrl.length,
+      });
+      toast({
+        title: "Missing Server URL",
+        description: "Enter an MCP server URL before connecting.",
+        variant: "destructive",
+      });
+      setConnectionStatus("error");
+      return;
+    }
 
     const clientCapabilities = {
       capabilities: {
@@ -417,7 +439,9 @@ export function useConnection({
       const headers: HeadersInit = {};
 
       // Create an auth provider with the current server URL
-      const serverAuthProvider = new InspectorOAuthClientProvider(sseUrl);
+      const serverAuthProvider = new InspectorOAuthClientProvider(
+        trimmedSseUrl,
+      );
 
       // Use custom headers (migration is handled in App.tsx)
       let finalHeaders: CustomHeaders = customHeaders || [];
@@ -441,6 +465,7 @@ export function useConnection({
             "Authorization header is enabled but missing a token. Please add a Bearer token (e.g., 'Bearer your-token-here') or disable the header.",
           variant: "destructive",
         });
+        setConnectionStatus("error");
         return; // Prevent connection attempt with invalid headers
       }
 
@@ -497,7 +522,7 @@ export function useConnection({
       // Determine connection URL based on the connection type
       if (connectionType === "direct" && transportType !== "stdio") {
         // Direct connection - use the provided URL directly (not available for STDIO)
-        serverUrl = new URL(sseUrl);
+        serverUrl = new URL(trimmedSseUrl);
 
         const requestHeaders = { ...headers };
         if (mcpSessionId) {
@@ -569,6 +594,32 @@ export function useConnection({
           proxyHeaders[proxyAuthTokenHeader] = `Bearer ${proxyAuthToken}`;
         }
 
+        const getCredentialProxyUrl = (): URL | null => {
+          try {
+            const candidateUrl = new URL(trimmedSseUrl);
+            const proxyUrl = new URL(getMCPProxyAddress(config));
+            const normalizedPath = candidateUrl.pathname.replace(/\/+$/, "");
+            const isProxyMcpUrl =
+              candidateUrl.origin === proxyUrl.origin &&
+              normalizedPath === "/mcp";
+            const hasCredentialParams =
+              candidateUrl.searchParams.has("credentialFile") &&
+              candidateUrl.searchParams.has("credentialKey");
+
+            if (
+              isProxyMcpUrl &&
+              hasCredentialParams &&
+              !candidateUrl.searchParams.has("url")
+            ) {
+              return candidateUrl;
+            }
+          } catch {
+            // Not a URL; fall through to normal proxy wrapping.
+          }
+
+          return null;
+        };
+
         let mcpProxyServerUrl;
         switch (transportType) {
           case "stdio": {
@@ -606,7 +657,7 @@ export function useConnection({
 
           case "sse": {
             mcpProxyServerUrl = new URL(`${getMCPProxyAddress(config)}/sse`);
-            mcpProxyServerUrl.searchParams.append("url", sseUrl);
+            mcpProxyServerUrl.searchParams.append("url", trimmedSseUrl);
 
             const proxyFullAddressSSE = config.MCP_PROXY_FULL_ADDRESS
               .value as string;
@@ -635,8 +686,17 @@ export function useConnection({
           }
 
           case "streamable-http":
-            mcpProxyServerUrl = new URL(`${getMCPProxyAddress(config)}/mcp`);
-            mcpProxyServerUrl.searchParams.append("url", sseUrl);
+            mcpProxyServerUrl =
+              getCredentialProxyUrl() ||
+              new URL(`${getMCPProxyAddress(config)}/mcp`);
+            if (!mcpProxyServerUrl.searchParams.has("credentialFile")) {
+              mcpProxyServerUrl.searchParams.append("url", trimmedSseUrl);
+            } else {
+              console.log(
+                "[useConnection] Using credential proxy URL directly:",
+                redactUrlForLog(mcpProxyServerUrl.toString()),
+              );
+            }
             transportOptions = {
               eventSourceInit: {
                 fetch: (
@@ -662,7 +722,7 @@ export function useConnection({
             break;
         }
         serverUrl = mcpProxyServerUrl as URL;
-        serverUrl.searchParams.append("transportType", transportType);
+        serverUrl.searchParams.set("transportType", transportType);
       }
 
       if (onNotification) {
@@ -688,7 +748,7 @@ export function useConnection({
       let capabilities;
       try {
         console.log(
-          `[useConnection] Creating ${transportType === "streamable-http" ? "StreamableHTTPClientTransport" : "SSEClientTransport"} to ${serverUrl}`,
+          `[useConnection] Creating ${transportType === "streamable-http" ? "StreamableHTTPClientTransport" : "SSEClientTransport"} to ${redactUrlForLog(serverUrl.toString())}`,
         );
         const transport =
           transportType === "streamable-http"
@@ -716,8 +776,8 @@ export function useConnection({
       } catch (error) {
         console.error(
           connectionType === "direct"
-            ? `Failed to connect directly to MCP Server at: ${serverUrl}:`
-            : `Failed to connect to MCP Server via the MCP Inspector Proxy: ${serverUrl}:`,
+            ? `Failed to connect directly to MCP Server at: ${redactUrlForLog(serverUrl.toString())}:`
+            : `Failed to connect to MCP Server via the MCP Inspector Proxy: ${redactUrlForLog(serverUrl.toString())}:`,
           error,
         );
 

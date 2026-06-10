@@ -38,7 +38,9 @@ type ServerConfig =
     }
   | {
       type: "sse" | "streamable-http";
-      url: string;
+      url?: string;
+      serverUrl?: string;
+      sseUrl?: string;
       note?: string;
     };
 
@@ -60,6 +62,14 @@ function handleError(error: unknown): never {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms, true));
+}
+
+function getServerConfigUrl(config: ServerConfig): string {
+  if ("command" in config) {
+    return "";
+  }
+
+  return config.url || config.serverUrl || config.sseUrl || "";
 }
 
 async function runWebClient(args: Args): Promise<void> {
@@ -330,13 +340,20 @@ function parseArgs(): Args {
         headers: options.header,
       };
     } else if (config.type === "sse" || config.type === "streamable-http") {
+      const serverUrl = getServerConfigUrl(config);
+      if (!serverUrl) {
+        throw new Error(
+          `Server '${options.server}' is type '${config.type}' but is missing a URL. Expected one of: url, serverUrl, sseUrl.`,
+        );
+      }
+
       return {
-        command: config.url,
+        command: serverUrl,
         args: finalArgs,
         envArgs: options.e || {},
         cli: options.cli || false,
         transport: config.type,
-        serverUrl: config.url,
+        serverUrl,
         headers: options.header,
       };
     } else {

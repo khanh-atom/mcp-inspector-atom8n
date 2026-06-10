@@ -55,6 +55,54 @@ export const getMCPProxyAuthToken = (
   };
 };
 
+export type ServerUrlField = "url" | "serverUrl" | "sseUrl";
+
+export const getServerConfigUrlSource = (
+  serverConfig: unknown,
+): ServerUrlField | null => {
+  if (!serverConfig || typeof serverConfig !== "object") {
+    return null;
+  }
+
+  const config = serverConfig as Partial<Record<ServerUrlField, unknown>>;
+  for (const field of ["url", "serverUrl", "sseUrl"] as const) {
+    const value = config[field];
+    if (typeof value === "string" && value.trim()) {
+      return field;
+    }
+  }
+
+  return null;
+};
+
+export const getServerConfigUrl = (serverConfig: unknown): string => {
+  const source = getServerConfigUrlSource(serverConfig);
+  if (!source || !serverConfig || typeof serverConfig !== "object") {
+    return "";
+  }
+
+  const value = (serverConfig as Partial<Record<ServerUrlField, unknown>>)[
+    source
+  ];
+  return typeof value === "string" ? value : "";
+};
+
+export const redactUrlForLog = (rawUrl: string): string => {
+  if (!rawUrl) {
+    return "";
+  }
+
+  try {
+    const url = new URL(rawUrl);
+    for (const key of Array.from(url.searchParams.keys())) {
+      url.searchParams.set(key, "REDACTED");
+    }
+    return url.toString();
+  } catch {
+    return `[unparseable URL, length=${rawUrl.length}]`;
+  }
+};
+
 export const getInitialTransportType = ():
   | "stdio"
   | "sse"

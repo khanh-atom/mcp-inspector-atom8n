@@ -90,6 +90,9 @@ import {
   getInitialArgs,
   initializeInspectorConfig,
   saveInspectorConfig,
+  getServerConfigUrl,
+  getServerConfigUrlSource,
+  redactUrlForLog,
 } from "./utils/configUtils";
 import ElicitationTab, {
   PendingElicitationRequest,
@@ -298,6 +301,23 @@ const App = () => {
               setCommand(first.command);
               setArgs(first.args ? first.args.join(" ") : "");
               if (first.env) setEnv(first.env);
+            } else {
+              const firstUrl = getServerConfigUrl(first);
+              if (firstUrl) {
+                setTransportType(
+                  first.type === "streamable-http" ? "streamable-http" : "sse",
+                );
+                setSseUrl(firstUrl);
+                console.log(
+                  "[App] Applied first URL server while sidebar collapsed:",
+                  {
+                    serverName: names[0],
+                    type: first.type,
+                    serverUrlSource: getServerConfigUrlSource(first),
+                    serverUrl: redactUrlForLog(firstUrl),
+                  },
+                );
+              }
             }
           }
         } else {
@@ -347,7 +367,10 @@ const App = () => {
         const serverName =
           Object.keys(servers).find((name) => {
             const s = servers[name];
-            return s.command === command;
+            if (transportType === "stdio") {
+              return s.command === command;
+            }
+            return getServerConfigUrl(s) === sseUrl;
           }) || Object.keys(servers)[0];
         const serverConfig = servers[serverName];
         if (serverConfig?.command) {
@@ -357,6 +380,24 @@ const App = () => {
           setCommand(serverConfig.command);
           setArgs(serverConfig.args ? serverConfig.args.join(" ") : "");
           if (serverConfig.env) setEnv(serverConfig.env);
+        } else {
+          const refreshedUrl = getServerConfigUrl(serverConfig);
+          if (refreshedUrl) {
+            console.log(
+              `[App] Applying refreshed URL config for "${serverName}":`,
+              {
+                type: serverConfig.type,
+                serverUrlSource: getServerConfigUrlSource(serverConfig),
+                serverUrl: redactUrlForLog(refreshedUrl),
+              },
+            );
+            setTransportType(
+              serverConfig.type === "streamable-http"
+                ? "streamable-http"
+                : "sse",
+            );
+            setSseUrl(refreshedUrl);
+          }
         }
       }
       // Also refresh sidebar
@@ -391,6 +432,16 @@ const App = () => {
   } | null>(null);
 
   const handleTestConnection = async (serverConfig: any) => {
+    const configuredServerUrl = getServerConfigUrl(serverConfig);
+    const configuredServerUrlSource = getServerConfigUrlSource(serverConfig);
+    console.log("[App] handleTestConnection server config:", {
+      type: serverConfig?.type,
+      hasCommand: Boolean(serverConfig?.command),
+      keys: Object.keys(serverConfig || {}),
+      serverUrlSource: configuredServerUrlSource,
+      serverUrl: redactUrlForLog(configuredServerUrl),
+    });
+
     // Apply the server configuration for testing
     if (serverConfig.command) {
       const newCmd = serverConfig.command;
@@ -409,11 +460,16 @@ const App = () => {
     } else if (
       serverConfig.type === "streamable-http" ||
       serverConfig.type === "sse" ||
-      serverConfig.url
+      configuredServerUrl
     ) {
-      const newUrl = serverConfig.url || serverConfig.sseUrl || "";
+      const newUrl = configuredServerUrl;
       const newTransport =
         serverConfig.type === "streamable-http" ? "streamable-http" : "sse";
+      console.log("[App] Applying URL server for test connection:", {
+        transportType: newTransport,
+        serverUrlSource: configuredServerUrlSource,
+        serverUrl: redactUrlForLog(newUrl),
+      });
       setTransportType(newTransport);
       setSseUrl(newUrl);
       // If a bearer token is provided (e.g., from stored credentials), set it as auth header
@@ -623,7 +679,11 @@ const App = () => {
     "[App] serverConfigForCurl derived from transportType:",
     transportType,
     "config:",
-    JSON.stringify(serverConfigForCurl),
+    JSON.stringify(
+      transportType === "stdio"
+        ? serverConfigForCurl
+        : { ...serverConfigForCurl, url: redactUrlForLog(sseUrl) },
+    ),
   );
 
   useEffect(() => {
@@ -1001,7 +1061,7 @@ const App = () => {
         } else {
           for (const s of servers) {
             const cfg = s.config || {};
-            const url = cfg.url || cfg.sseUrl;
+            const url = getServerConfigUrl(cfg);
             if (url && url === sseUrl) {
               matched = s.name;
               break;

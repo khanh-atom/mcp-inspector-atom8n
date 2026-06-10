@@ -54,6 +54,75 @@ const { values } = parseArgs({
   },
 });
 
+class HttpError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    message: string,
+    public readonly error = statusCode === 400
+      ? "Bad Request"
+      : "Internal Server Error",
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
+const getQueryString = (value: unknown): string | undefined => {
+  if (typeof value === "string") {
+    return value.trim() || undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const stringValue = getQueryString(item);
+      if (stringValue) {
+        return stringValue;
+      }
+    }
+  }
+
+  return undefined;
+};
+
+const parseTransportUrl = (
+  value: string | undefined,
+  transportType: string,
+): URL => {
+  if (!value) {
+    throw new HttpError(
+      400,
+      `Missing 'url' query parameter for ${transportType} transport`,
+    );
+  }
+
+  try {
+    return new URL(value);
+  } catch (error) {
+    throw new HttpError(
+      400,
+      `Invalid 'url' query parameter for ${transportType} transport: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+};
+
+const sendErrorResponse = (
+  res: express.Response,
+  error: unknown,
+  fallbackStatus = 500,
+) => {
+  if (error instanceof HttpError) {
+    res.status(error.statusCode).json({
+      error: error.error,
+      message: error.message,
+    });
+    return;
+  }
+
+  res.status(fallbackStatus).json(error);
+};
+
 // Function to get HTTP headers.
 const getHttpHeaders = (req: express.Request): Record<string, string> => {
   const headers: Record<string, string> = {};
@@ -139,6 +208,7 @@ const getHttpHeaders = (req: express.Request): Record<string, string> => {
 const updateHeadersInPlace = (
   currentHeaders: Record<string, string>,
   newHeaders: Record<string, string>,
+  preserveAuthorization = false,
 ) => {
   // Preserve headers that are set at transport creation and
   // are not present in subsequent client requests.
@@ -155,7 +225,10 @@ const updateHeadersInPlace = (
   if (accept && !currentHeaders["Accept"]) {
     currentHeaders["Accept"] = accept;
   }
-  if (authorization && !currentHeaders["Authorization"]) {
+  if (preserveAuthorization && authorization) {
+    delete currentHeaders["authorization"];
+    currentHeaders["Authorization"] = authorization;
+  } else if (authorization && !currentHeaders["Authorization"]) {
     currentHeaders["Authorization"] = authorization;
   }
 };
@@ -169,7 +242,10 @@ app.use((req, res, next) => {
 
 const webAppTransports: Map<string, Transport> = new Map<string, Transport>(); // Web app transports by web app sessionId
 const serverTransports: Map<string, Transport> = new Map<string, Transport>(); // Server Transports by web app sessionId
-const sessionHeaderHolders: Map<string, { headers: HeadersInit }> = new Map(); // For dynamic header updates
+const sessionHeaderHolders: Map<
+  string,
+  { headers: HeadersInit; preserveAuthorization?: boolean }
+> = new Map(); // For dynamic header updates
 
 // Cache for execute-tool connections: reuse client+transport per serverName
 type CachedExecuteToolConnection = { client: Client; transport: Transport };
@@ -427,50 +503,54 @@ const createTransport = async (
   req: express.Request,
 ): Promise<{
   transport: Transport;
-  headerHolder?: { headers: HeadersInit };
+  headerHolder?: { headers: HeadersInit; preserveAuthorization?: boolean };
 }> => {
   const query = req.query;
   logger.info("Query parameters:", JSON.stringify(query));
 
-  let transportType = query.transportType as string | undefined;
+  let transportType = getQueryString(query.transportType);
+  let upstreamUrl = getQueryString(query.url);
+  const credentialFile = getQueryString(query.credentialFile);
+  const credentialKey = getQueryString(query.credentialKey);
 
-  // [PROXY] When credentialFile+credentialKey are provided but url/transportType are not,
+  // [PROXY] When credentialFile+credentialKey are provided but url is not,
   // derive the upstream URL from the credential's server_url and default to streamable-http.
-  if (!transportType && !query.url) {
-    const credentialFile = query.credentialFile as string | undefined;
-    const credentialKey = query.credentialKey as string | undefined;
-    if (credentialFile && credentialKey) {
-      const effectiveFolder = getEffectiveCredentialsFolderPath();
-      const meta: CredentialMeta = {
-        folderPath: effectiveFolder,
-        sourceFile: credentialFile,
-        credentialKey: credentialKey,
-      };
-      console.log(
-        `[createTransport:proxy] No url/transportType — deriving from credential: ${credentialFile}/${credentialKey}`,
-      );
-      try {
-        const located = await readCredentialByMeta(meta);
-        if (located.credential.server_url) {
-          (query as any).url = located.credential.server_url;
-          transportType = "streamable-http";
-          console.log(
-            `[createTransport:proxy] Derived url=${located.credential.server_url}, transportType=streamable-http`,
-          );
-        } else {
-          throw new Error(
-            `Credential '${credentialKey}' in ${credentialFile} has no server_url`,
-          );
-        }
-      } catch (error) {
-        console.error(
-          `[createTransport:proxy] Failed to derive url from credential:`,
-          error,
+  if (
+    !upstreamUrl &&
+    credentialFile &&
+    credentialKey &&
+    (!transportType || transportType === "streamable-http")
+  ) {
+    const effectiveFolder = getEffectiveCredentialsFolderPath();
+    const meta: CredentialMeta = {
+      folderPath: effectiveFolder,
+      sourceFile: credentialFile,
+      credentialKey: credentialKey,
+    };
+    console.log(
+      `[createTransport:proxy] No url — deriving from credential: ${credentialFile}/${credentialKey}`,
+    );
+    try {
+      const located = await readCredentialByMeta(meta);
+      upstreamUrl = located.credential.server_url?.trim();
+      if (upstreamUrl) {
+        transportType = transportType || "streamable-http";
+        console.log(
+          `[createTransport:proxy] Derived url=${upstreamUrl}, transportType=${transportType}`,
         );
+      } else {
         throw new Error(
-          `Cannot derive upstream URL from credential: ${error instanceof Error ? error.message : String(error)}`,
+          `Credential '${credentialKey}' in ${credentialFile} has no server_url`,
         );
       }
+    } catch (error) {
+      console.error(
+        `[createTransport:proxy] Failed to derive url from credential:`,
+        error,
+      );
+      throw new Error(
+        `Cannot derive upstream URL from credential: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -499,17 +579,17 @@ const createTransport = async (
     await transport.start();
     return { transport };
   } else if (transportType === "sse") {
-    const url = query.url as string;
+    const url = parseTransportUrl(upstreamUrl, transportType);
 
     const headers = getHttpHeaders(req);
     headers["Accept"] = "text/event-stream";
     const headerHolder = { headers };
 
     logger.info(
-      `SSE transport: url=${url}, headers=${JSON.stringify(headers)}`,
+      `SSE transport: url=${url.toString()}, headers=${JSON.stringify(headers)}`,
     );
 
-    const transport = new SSEClientTransport(new URL(url), {
+    const transport = new SSEClientTransport(url, {
       eventSourceInit: {
         fetch: createCustomFetch(headerHolder),
       },
@@ -520,39 +600,92 @@ const createTransport = async (
     await transport.start();
     return { transport, headerHolder };
   } else if (transportType === "streamable-http") {
-    const upstreamUrl = query.url as string;
+    const url = parseTransportUrl(upstreamUrl, transportType);
     const headers = getHttpHeaders(req);
     headers["Accept"] = "text/event-stream, application/json";
 
-    // [PROXY] Auto-inject credentials if no Authorization header present
-    if (!headers["Authorization"] && !headers["authorization"]) {
-      const credentialFile = query.credentialFile as string | undefined;
-      const credentialKey = query.credentialKey as string | undefined;
-
-      // [PROXY] Prefer direct credential lookup by identity (from Install)
-      let credentialInjected = false;
-      if (credentialFile && credentialKey) {
-        const effectiveFolder = getEffectiveCredentialsFolderPath();
-        const meta: CredentialMeta = {
-          folderPath: effectiveFolder,
-          sourceFile: credentialFile,
-          credentialKey: credentialKey,
-        };
+    let credentialInjected = false;
+    if (credentialFile && credentialKey) {
+      if (headers["Authorization"] || headers["authorization"]) {
+        delete headers["Authorization"];
+        delete headers["authorization"];
         console.log(
-          `[createTransport:proxy] Direct credential lookup: ${credentialFile}/${credentialKey} in folder: ${effectiveFolder}`,
+          "[createTransport:proxy] Credential params provided; replacing client Authorization header with stored credential token",
         );
-        try {
-          const located = await readCredentialByMeta(meta);
+      }
+
+      const effectiveFolder = getEffectiveCredentialsFolderPath();
+      const meta: CredentialMeta = {
+        folderPath: effectiveFolder,
+        sourceFile: credentialFile,
+        credentialKey: credentialKey,
+      };
+      console.log(
+        `[createTransport:proxy] Direct credential lookup: ${credentialFile}/${credentialKey} in folder: ${effectiveFolder}`,
+      );
+      try {
+        const located = await readCredentialByMeta(meta);
+        const safetyMarginMs = 60_000;
+        if (
+          located.credential.expires_at &&
+          located.credential.expires_at <= Date.now() + safetyMarginMs
+        ) {
+          console.log(
+            "[createTransport:proxy] Token expired or expiring, refreshing...",
+          );
+          try {
+            const refreshResult = await refreshCredentialToken(meta);
+            headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
+            console.log("[createTransport:proxy] Injected refreshed token");
+          } catch (refreshErr) {
+            headers["Authorization"] =
+              `Bearer ${located.credential.access_token}`;
+            console.warn(
+              "[createTransport:proxy] Refresh failed, using existing token:",
+              refreshErr,
+            );
+          }
+        } else {
+          headers["Authorization"] =
+            `Bearer ${located.credential.access_token}`;
+          console.log(
+            "[createTransport:proxy] Injected token from direct credential lookup",
+          );
+        }
+        credentialInjected = true;
+      } catch (error) {
+        console.warn(
+          "[createTransport:proxy] Direct credential lookup failed, will try URL search:",
+          error,
+        );
+      }
+    }
+
+    // [PROXY] Auto-inject credentials by URL only when the client did not
+    // explicitly provide Authorization and direct credential lookup did not run.
+    if (
+      !credentialInjected &&
+      !headers["Authorization"] &&
+      !headers["authorization"]
+    ) {
+      // [PROXY] Fallback: search by upstream URL if direct lookup wasn't available or failed
+      console.log(
+        `[createTransport:proxy] Searching credential by upstream URL: ${redactUrlForLog(url.toString())}`,
+      );
+      try {
+        const located = await findCredentialForServerUrl(url.toString());
+        if (located?.credential.access_token) {
           const safetyMarginMs = 60_000;
           if (
             located.credential.expires_at &&
-            located.credential.expires_at <= Date.now() + safetyMarginMs
+            located.credential.expires_at <= Date.now() + safetyMarginMs &&
+            located.meta
           ) {
             console.log(
               "[createTransport:proxy] Token expired or expiring, refreshing...",
             );
             try {
-              const refreshResult = await refreshCredentialToken(meta);
+              const refreshResult = await refreshCredentialToken(located.meta);
               headers["Authorization"] = `Bearer ${refreshResult.accessToken}`;
               console.log("[createTransport:proxy] Injected refreshed token");
             } catch (refreshErr) {
@@ -567,78 +700,32 @@ const createTransport = async (
             headers["Authorization"] =
               `Bearer ${located.credential.access_token}`;
             console.log(
-              "[createTransport:proxy] Injected token from direct credential lookup",
+              "[createTransport:proxy] Injected credential from URL search",
             );
           }
-          credentialInjected = true;
-        } catch (error) {
-          console.warn(
-            "[createTransport:proxy] Direct credential lookup failed, will try URL search:",
-            error,
+        } else {
+          console.log(
+            "[createTransport:proxy] No matching credential found for upstream URL",
           );
         }
-      }
-
-      // [PROXY] Fallback: search by upstream URL if direct lookup wasn't available or failed
-      if (!credentialInjected) {
-        console.log(
-          `[createTransport:proxy] Searching credential by upstream URL: ${upstreamUrl}`,
+      } catch (error) {
+        console.warn(
+          "[createTransport:proxy] Credential URL search failed:",
+          error,
         );
-        try {
-          const located = await findCredentialForServerUrl(upstreamUrl);
-          if (located?.credential.access_token) {
-            const safetyMarginMs = 60_000;
-            if (
-              located.credential.expires_at &&
-              located.credential.expires_at <= Date.now() + safetyMarginMs &&
-              located.meta
-            ) {
-              console.log(
-                "[createTransport:proxy] Token expired or expiring, refreshing...",
-              );
-              try {
-                const refreshResult = await refreshCredentialToken(
-                  located.meta,
-                );
-                headers["Authorization"] =
-                  `Bearer ${refreshResult.accessToken}`;
-                console.log("[createTransport:proxy] Injected refreshed token");
-              } catch (refreshErr) {
-                headers["Authorization"] =
-                  `Bearer ${located.credential.access_token}`;
-                console.warn(
-                  "[createTransport:proxy] Refresh failed, using existing token:",
-                  refreshErr,
-                );
-              }
-            } else {
-              headers["Authorization"] =
-                `Bearer ${located.credential.access_token}`;
-              console.log(
-                "[createTransport:proxy] Injected credential from URL search",
-              );
-            }
-          } else {
-            console.log(
-              "[createTransport:proxy] No matching credential found for upstream URL",
-            );
-          }
-        } catch (error) {
-          console.warn(
-            "[createTransport:proxy] Credential URL search failed:",
-            error,
-          );
-        }
       }
-    } else {
+    } else if (!credentialInjected) {
       console.log(
         "[createTransport:proxy] Client already provided Authorization header",
       );
     }
 
-    const headerHolder = { headers };
+    const headerHolder = {
+      headers,
+      preserveAuthorization: credentialInjected,
+    };
 
-    const transport = new StreamableHTTPClientTransport(new URL(upstreamUrl), {
+    const transport = new StreamableHTTPClientTransport(url, {
       // Pass a custom fetch to inject the latest headers on each request
       fetch: createCustomFetch(headerHolder),
     });
@@ -663,6 +750,7 @@ app.get(
       updateHeadersInPlace(
         headerHolder.headers as Record<string, string>,
         getHttpHeaders(req),
+        headerHolder.preserveAuthorization,
       );
     }
 
@@ -697,6 +785,7 @@ app.post(
         updateHeadersInPlace(
           headerHolder.headers as Record<string, string>,
           getHttpHeaders(req),
+          headerHolder.preserveAuthorization,
         );
       }
 
@@ -814,8 +903,16 @@ app.post(
           res.status(401).json(error);
           return;
         }
+        if (error instanceof HttpError) {
+          console.warn(
+            "Invalid transport configuration in /mcp POST route:",
+            error.message,
+          );
+          sendErrorResponse(res, error);
+          return;
+        }
         console.error("Error in /mcp POST route:", error);
-        res.status(500).json(error);
+        sendErrorResponse(res, error);
       }
     }
   },
@@ -1061,6 +1158,11 @@ app.get(
         res.status(401).json(error);
         return;
       }
+      if (error instanceof HttpError) {
+        console.error("[STDIO] Invalid transport configuration:", error);
+        sendErrorResponse(res, error);
+        return;
+      }
       console.error("[STDIO] Error in /stdio route:", error);
       res.status(500).json(error);
     }
@@ -1115,14 +1217,14 @@ app.get(
           const headers = getHttpHeaders(req);
           headers["Accept"] = "text/event-stream, application/json";
           const headerHolder = { headers };
-          const url = (req.query.url as string) || "";
-
-          const serverTransport = new StreamableHTTPClientTransport(
-            new URL(url),
-            {
-              fetch: createCustomFetch(headerHolder),
-            },
+          const url = parseTransportUrl(
+            getQueryString(req.query.url),
+            "streamable-http",
           );
+
+          const serverTransport = new StreamableHTTPClientTransport(url, {
+            fetch: createCustomFetch(headerHolder),
+          });
           await serverTransport.start();
 
           const proxyFullAddress = (req.query.proxyFullAddress as string) || "";
@@ -1146,7 +1248,7 @@ app.get(
               "StreamableHTTP fallback failed in /sse route:",
               fallbackError,
             );
-            res.status(500).json(fallbackError);
+            sendErrorResponse(res, fallbackError);
           }
           return;
         }
@@ -1167,6 +1269,11 @@ app.get(
           "Received 404 not found from MCP server. Does the MCP server support SSE?",
         );
         res.status(404).json(error);
+        return;
+      }
+      if (error instanceof HttpError) {
+        console.error("Invalid transport configuration in /sse route:", error);
+        sendErrorResponse(res, error);
         return;
       }
       if (JSON.stringify(error).includes("ECONNREFUSED")) {
@@ -1194,6 +1301,7 @@ app.post(
         updateHeadersInPlace(
           headerHolder.headers as Record<string, string>,
           getHttpHeaders(req),
+          headerHolder.preserveAuthorization,
         );
       }
 
@@ -1558,9 +1666,14 @@ app.get(
       let transport: Transport;
       let headerHolder: { headers: HeadersInit } | undefined;
 
-      if (serverConfig.type === "sse" || serverConfig.url) {
+      const configuredUrl = getServerConfigUrl(serverConfig);
+      if (
+        serverConfig.type === "sse" ||
+        serverConfig.type === "streamable-http" ||
+        configuredUrl
+      ) {
         // SSE or StreamableHTTP transport
-        const url = serverConfig.url || serverConfig.sseUrl;
+        const url = configuredUrl;
         if (!url) {
           res.status(400).json({
             error: "Bad Request",
@@ -2173,6 +2286,20 @@ function normalizeServerUrl(value: unknown): string | null {
   }
 }
 
+function redactUrlForLog(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "";
+
+  try {
+    const url = new URL(value.trim());
+    for (const key of Array.from(url.searchParams.keys())) {
+      url.searchParams.set(key, "REDACTED");
+    }
+    return url.toString();
+  } catch {
+    return `[unparseable URL, length=${value.length}]`;
+  }
+}
+
 const CREDENTIAL_ID_PREFIX = "credential:";
 
 function createCredentialIdentity(
@@ -2199,7 +2326,9 @@ function isCredentialAllowedByEnabledState(
 function getServerConfigUrl(
   serverConfig: Record<string, unknown>,
 ): string | null {
-  return normalizeServerUrl(serverConfig.url || serverConfig.sseUrl);
+  return normalizeServerUrl(
+    serverConfig.url || serverConfig.serverUrl || serverConfig.sseUrl,
+  );
 }
 
 async function findCredentialForServerUrl(
@@ -2426,10 +2555,15 @@ async function createExecuteToolConnection(
 ): Promise<CachedExecuteToolConnection> {
   let transport: Transport;
   let headerHolder: { headers: HeadersInit } | undefined;
+  const configuredUrl = getServerConfigUrl(serverConfig);
 
-  if (serverConfig.type === "sse" || serverConfig.url) {
-    const url = serverConfig.url || serverConfig.sseUrl;
-    if (!url || typeof url !== "string") {
+  if (
+    serverConfig.type === "sse" ||
+    serverConfig.type === "streamable-http" ||
+    configuredUrl
+  ) {
+    const url = configuredUrl;
+    if (!url) {
       throw new Error(
         "Server configuration missing URL for SSE/HTTP transport",
       );
@@ -2439,7 +2573,7 @@ async function createExecuteToolConnection(
     // [CREDENTIALS] Inject credential access_token as Authorization header
     if (accessToken) {
       logger.info(
-        `[execute-tool:credentials] Injecting Authorization header for URL: ${url}`,
+        `[execute-tool:credentials] Injecting Authorization header for URL: ${redactUrlForLog(url)}`,
       );
       headers["Authorization"] = `Bearer ${accessToken}`;
     }
@@ -2902,7 +3036,11 @@ app.post(
         `[execute-tool] Executing tool '${toolName}' via cacheKey='${cacheKey}'`,
       );
       logger.info(
-        `[execute-tool] Resolved server URL for credential lookup: ${getServerConfigUrl(resolvedServerConfig) || "<none>"}`,
+        `[execute-tool] Resolved server URL for credential lookup: ${
+          getServerConfigUrl(resolvedServerConfig)
+            ? redactUrlForLog(getServerConfigUrl(resolvedServerConfig))
+            : "<none>"
+        }`,
       );
 
       let locatedCredential: LocatedCredential | null = null;

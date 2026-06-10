@@ -914,7 +914,7 @@ describe("useConnection", () => {
       expect(headers).toHaveProperty("Authorization", "Bearer mock-token");
     });
 
-    test("warns of enabled empty Bearer token", async () => {
+    test("blocks enabled empty Bearer token", async () => {
       // This test prevents regression of the bug where default "Bearer " header
       // prevented OAuth token injection, causing infinite auth loops
       const customHeaders: CustomHeaders = [
@@ -936,18 +936,13 @@ describe("useConnection", () => {
         await result.current.connect();
       });
 
-      const headers = mockSSETransport.options?.requestInit?.headers;
-
-      expect(headers).toHaveProperty("Authorization", "Bearer");
-      // Should not have the x-custom-auth-headers since Authorization is standard
-      expect(headers).not.toHaveProperty("x-custom-auth-headers");
-
-      // Should show toast notification for empty Authorization header
       expect(mockToast).toHaveBeenCalledWith({
         title: "Invalid Authorization Header",
         description: expect.any(String),
         variant: "destructive",
       });
+      expect(mockSSETransport.options).toBeUndefined();
+      expect(result.current.connectionStatus).toBe("error");
     });
 
     test("prioritizes custom headers over legacy auth", async () => {
@@ -1021,6 +1016,28 @@ describe("useConnection", () => {
       expect(mockSSETransport.url?.searchParams.get("transportType")).toBe(
         "sse",
       );
+    });
+
+    test("does not create HTTP transport when server URL is empty", async () => {
+      const props = {
+        ...defaultProps,
+        transportType: "streamable-http" as const,
+        sseUrl: "   ",
+      };
+
+      const { result } = renderHook(() => useConnection(props));
+
+      await act(async () => {
+        await result.current.connect();
+      });
+
+      expect(mockToast).toHaveBeenCalledWith({
+        title: "Missing Server URL",
+        description: "Enter an MCP server URL before connecting.",
+        variant: "destructive",
+      });
+      expect(mockStreamableHTTPTransport.url).toBeUndefined();
+      expect(result.current.connectionStatus).toBe("error");
     });
   });
 

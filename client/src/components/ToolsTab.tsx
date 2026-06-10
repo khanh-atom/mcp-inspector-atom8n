@@ -38,7 +38,11 @@ import {
 } from "lucide-react";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { InspectorConfig } from "@/lib/configurationTypes";
-import { getMCPProxyAddress, getMCPProxyAuthToken } from "@/utils/configUtils";
+import {
+  getMCPProxyAddress,
+  getMCPProxyAuthToken,
+  getServerConfigUrl,
+} from "@/utils/configUtils";
 import ListPane from "./ListPane";
 import JsonView from "./JsonView";
 import ToolResults from "./ToolResults";
@@ -357,7 +361,7 @@ const ToolsTab = ({
         }
       }
 
-      const serverUrl = normalizeCredentialUrl(server.url || server.sseUrl);
+      const serverUrl = normalizeCredentialUrl(getServerConfigUrl(server));
       const requestBody: Record<string, unknown> = {
         toolName: tool.name,
         toolArgs: toolParams,

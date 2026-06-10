@@ -33,7 +33,13 @@ import {
   LoggingLevelSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { InspectorConfig } from "@/lib/configurationTypes";
-import { getMCPProxyAddress, getMCPProxyAuthToken } from "@/utils/configUtils";
+import {
+  getMCPProxyAddress,
+  getMCPProxyAuthToken,
+  getServerConfigUrl,
+  getServerConfigUrlSource,
+  redactUrlForLog,
+} from "@/utils/configUtils";
 import { ConnectionStatus } from "@/lib/constants";
 import useTheme from "../lib/hooks/useTheme";
 import { version } from "../../../package.json";
@@ -137,8 +143,15 @@ const Sidebar = ({
   // Apply server configuration to the form
   const applyServerConfig = useCallback(
     (serverConfig: any) => {
-      console.log("Applying server configuration:", serverConfig);
-      console.log("Server config keys:", Object.keys(serverConfig));
+      const serverUrl = getServerConfigUrl(serverConfig);
+      const serverUrlSource = getServerConfigUrlSource(serverConfig);
+      console.log("Applying server configuration:", {
+        type: serverConfig?.type,
+        hasCommand: Boolean(serverConfig?.command),
+        keys: Object.keys(serverConfig || {}),
+        serverUrlSource,
+        serverUrl: redactUrlForLog(serverUrl),
+      });
 
       if (serverConfig.command) {
         console.log(
@@ -155,17 +168,21 @@ const Sidebar = ({
       } else if (serverConfig.type === "streamable-http") {
         console.log(
           "Detected Streamable HTTP server with URL:",
-          serverConfig.url,
+          redactUrlForLog(serverUrl),
+          "source:",
+          serverUrlSource,
         );
         setTransportType("streamable-http");
-        setSseUrl(serverConfig.url || "");
-      } else if (serverConfig.type === "sse" || serverConfig.url) {
+        setSseUrl(serverUrl);
+      } else if (serverConfig.type === "sse" || serverUrl) {
         console.log(
           "Detected SSE server with URL:",
-          serverConfig.url || serverConfig.sseUrl,
+          redactUrlForLog(serverUrl),
+          "source:",
+          serverUrlSource,
         );
         setTransportType("sse");
-        setSseUrl(serverConfig.url || serverConfig.sseUrl || "");
+        setSseUrl(serverUrl);
       } else {
         console.warn("Unknown server configuration type:", serverConfig);
         console.warn("Server config does not match expected patterns");
