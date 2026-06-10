@@ -44,7 +44,7 @@
     "prettier-fix": "prettier --write .",
     "prettier-check": "prettier --check .",
     "lint": "prettier --check . && cd client && npm run lint",
-    "prepare": "npm run bump-version && husky && npm run build",
+    "prepare": "npm run bump-version && husky && npm run build && npm login",
     "publish-all": "npm publish --workspaces --access public && npm publish --access public",
     "bump-version": "node .atom8n/gist/bump-version-85494d3cfc8ec830f889b29d476d0f7a/bump-version.mjs",
     "update-version": "node scripts/update-version.js",
