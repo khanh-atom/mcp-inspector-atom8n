@@ -274,6 +274,16 @@ const normalizeEnabledCredentialsForEntries = (
   return normalized;
 };
 
+const buildCredentialFilePath = (folderPath: string, fileName: string) => {
+  const trimmedFolder = folderPath.trim();
+  if (!trimmedFolder) return fileName;
+  const separator =
+    trimmedFolder.includes("\\") && !trimmedFolder.includes("/") ? "\\" : "/";
+  const needsSeparator =
+    !trimmedFolder.endsWith("/") && !trimmedFolder.endsWith("\\");
+  return `${trimmedFolder}${needsSeparator ? separator : ""}${fileName}`;
+};
+
 const CredentialsTab = ({
   config,
   credentialsFolderPath,
@@ -529,6 +539,54 @@ const CredentialsTab = ({
       loadCredentials(trimmed);
     },
     [setCredentialsFolderPath, loadCredentials],
+  );
+
+  const handleOpenCredentialFile = useCallback(
+    async (fileName: string) => {
+      if (!credentialsFolderPath) {
+        toast({
+          title: "Cannot open file",
+          description: "No credentials folder is selected",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const filePath = buildCredentialFilePath(credentialsFolderPath, fileName);
+
+      try {
+        const baseUrl = getMCPProxyAddress(config);
+        const { token, header } = getMCPProxyAuthToken(config);
+        const resp = await fetch(
+          `${baseUrl}/open-config-file?path=${encodeURIComponent(filePath)}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              [header]: token ? `Bearer ${token}` : "",
+            },
+          },
+        );
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(
+            err.message || `Failed to open file (${resp.status})`,
+          );
+        }
+      } catch (error) {
+        console.error(
+          "[CredentialsTab] Failed to open credential file:",
+          error,
+        );
+        toast({
+          title: "Failed to open file",
+          description: error instanceof Error ? error.message : String(error),
+          variant: "destructive",
+        });
+      }
+    },
+    [config, credentialsFolderPath, toast],
   );
 
   // [DRAG-DROP] Handle file drop — read content and upload to server into the selected folder
@@ -2008,7 +2066,14 @@ const CredentialsTab = ({
                 {/* File header */}
                 <div className="flex items-center gap-2 text-xs text-muted-foreground px-1">
                   <FileText className="w-3.5 h-3.5" />
-                  <span className="font-medium">{fileName}</span>
+                  <button
+                    type="button"
+                    className="font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                    onClick={() => handleOpenCredentialFile(fileName)}
+                    title={`Open ${fileName}`}
+                  >
+                    {fileName}
+                  </button>
                   <Badge variant="outline" className="text-[10px] px-1.5 py-0">
                     {fileEntries.length}
                   </Badge>
@@ -2142,9 +2207,16 @@ const CredentialsTab = ({
                                   <p className="text-xs font-medium text-muted-foreground mb-1">
                                     Source File
                                   </p>
-                                  <p className="text-sm font-mono bg-muted px-3 py-1.5 rounded">
+                                  <button
+                                    type="button"
+                                    className="block w-full text-left text-sm font-mono bg-muted px-3 py-1.5 rounded text-primary hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                    onClick={() =>
+                                      handleOpenCredentialFile(entry.sourceFile)
+                                    }
+                                    title={`Open ${entry.sourceFile}`}
+                                  >
                                     {entry.sourceFile}
-                                  </p>
+                                  </button>
                                 </div>
 
                                 {/* Access Token */}
