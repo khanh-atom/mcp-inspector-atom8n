@@ -4205,6 +4205,116 @@ app.post(
   },
 );
 
+// POST /credentials/oauth-result — Persist freshly authenticated OAuth tokens
+// into the selected credential entry.
+app.post(
+  "/credentials/oauth-result",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const {
+        folderPath: rawFolder,
+        sourceFile,
+        credentialKey,
+        serverName,
+        serverUrl,
+        clientId,
+        tokens,
+      } = req.body;
+
+      if (!rawFolder || !sourceFile || !credentialKey || !tokens) {
+        logger.warn(
+          "[credentials:oauth-result] Missing 'folderPath', 'sourceFile', 'credentialKey', or 'tokens'",
+        );
+        res.status(400).json({
+          error: "Bad Request",
+          message:
+            "'folderPath', 'sourceFile', 'credentialKey', and 'tokens' are all required",
+        });
+        return;
+      }
+
+      if (!tokens.access_token || typeof tokens.access_token !== "string") {
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'tokens.access_token' is required",
+        });
+        return;
+      }
+
+      const meta: CredentialMeta = {
+        folderPath: rawFolder,
+        sourceFile,
+        credentialKey,
+      };
+      const filePath = credentialFilePath(meta);
+      const credentials = await readCredentialFile(meta);
+      const existingCredential = credentials[credentialKey] || {};
+      const scopes =
+        typeof tokens.scope === "string"
+          ? tokens.scope.split(/\s+/).filter(Boolean)
+          : Array.isArray(tokens.scopes)
+            ? tokens.scopes.filter(
+                (scope: unknown): scope is string => typeof scope === "string",
+              )
+            : existingCredential.scopes || [];
+      const expiresAt =
+        typeof tokens.expires_in === "number"
+          ? Date.now() + tokens.expires_in * 1000
+          : typeof tokens.expires_at === "number"
+            ? tokens.expires_at
+            : existingCredential.expires_at || null;
+
+      credentials[credentialKey] = {
+        ...existingCredential,
+        server_name:
+          typeof serverName === "string" && serverName.trim()
+            ? serverName.trim()
+            : existingCredential.server_name || credentialKey.split("|")[0],
+        server_url:
+          typeof serverUrl === "string" && serverUrl.trim()
+            ? serverUrl.trim()
+            : existingCredential.server_url || "",
+        client_id:
+          typeof clientId === "string" && clientId.trim()
+            ? clientId.trim()
+            : existingCredential.client_id || "",
+        access_token: tokens.access_token,
+        expires_at: expiresAt,
+        refresh_token:
+          typeof tokens.refresh_token === "string"
+            ? tokens.refresh_token
+            : existingCredential.refresh_token || "",
+        scopes,
+      };
+
+      await fs.writeFile(
+        filePath,
+        JSON.stringify(credentials, null, 4),
+        "utf8",
+      );
+
+      logger.info(
+        `[credentials:oauth-result] Saved OAuth tokens for '${credentialKey}' in ${sourceFile}`,
+      );
+      res.json({
+        success: true,
+        credentialKey,
+        sourceFile,
+        expiresAt,
+      });
+    } catch (error: any) {
+      logger.error(`[credentials:oauth-result] Error:`, error);
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
 // POST /credentials/choose-folder — Open native folder picker
 app.post(
   "/credentials/choose-folder",

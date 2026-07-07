@@ -4,6 +4,11 @@ import { SESSION_KEYS } from "../lib/constants";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { useToast } from "@/lib/hooks/useToast";
 import {
+  readPendingCredentialAuth,
+  saveCredentialAuthResult,
+} from "./CredentialsTab";
+import { initializeInspectorConfig } from "@/utils/configUtils";
+import {
   generateOAuthErrorDescription,
   parseOAuthCallbackParams,
 } from "@/utils/oauthUtils.ts";
@@ -59,6 +64,46 @@ const OAuthCallback = ({ onConnect }: OAuthCallbackProps) => {
         return notifyError(
           `Expected to be authorized after providing auth code, got: ${result}`,
         );
+      }
+
+      const pendingCredentialAuth = readPendingCredentialAuth();
+      if (pendingCredentialAuth) {
+        try {
+          const serverAuthProvider = new InspectorOAuthClientProvider(
+            serverUrl,
+          );
+          const [tokens, clientInformation] = await Promise.all([
+            serverAuthProvider.tokens(),
+            serverAuthProvider.clientInformation(),
+          ]);
+
+          if (!tokens) {
+            throw new Error("OAuth completed without tokens");
+          }
+
+          await saveCredentialAuthResult({
+            config: initializeInspectorConfig("inspectorConfig_v1"),
+            pendingAuth: pendingCredentialAuth,
+            tokens,
+            clientId:
+              clientInformation?.client_id || pendingCredentialAuth.clientId,
+          });
+          sessionStorage.removeItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+
+          toast({
+            title: "Success",
+            description: `Saved OAuth tokens for ${pendingCredentialAuth.serverName}`,
+            variant: "default",
+          });
+        } catch (error) {
+          console.error("Credential OAuth save error:", error);
+          sessionStorage.removeItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+          return notifyError(
+            `Authenticated, but failed to save credential tokens: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
 
       // Finally, trigger auto-connect

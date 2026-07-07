@@ -21,6 +21,16 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
+  auth,
+  type AuthResult,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import type { OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
+import {
+  InspectorOAuthClientProvider,
+  saveClientInformationToSessionStorage,
+} from "@/lib/auth";
+import { SESSION_KEYS } from "@/lib/constants";
+import {
   Shield,
   Upload,
   RefreshCw,
@@ -40,6 +50,7 @@ import {
   Download,
   Trash2,
   Network,
+  LogIn,
   Search,
   CheckSquare,
   Square,
@@ -84,6 +95,16 @@ interface CredentialTestServerConfig {
   type: "streamable-http";
   url: string;
   bearerToken?: string;
+}
+
+interface PendingCredentialAuth {
+  folderPath: string;
+  sourceFile: string;
+  credentialKey: string;
+  credentialId: string;
+  serverName: string;
+  serverUrl: string;
+  clientId: string;
 }
 
 /** [PROXY] Tool info returned from the credential-server-tools endpoint */
@@ -145,6 +166,85 @@ const getCredentialRecord = (
   entry: Pick<CredentialEntry, "id" | "sourceFile" | "key">,
 ) =>
   rawCredentials?.[getCredentialIdentity(entry)] || rawCredentials?.[entry.key];
+
+export const saveCredentialAuthResult = async ({
+  config,
+  pendingAuth,
+  tokens,
+  clientId,
+}: {
+  config: InspectorConfig;
+  pendingAuth: PendingCredentialAuth;
+  tokens: OAuthTokens;
+  clientId: string;
+}) => {
+  const baseUrl = getMCPProxyAddress(config);
+  const { token, header } = getMCPProxyAuthToken(config);
+  const resp = await fetch(`${baseUrl}/credentials/oauth-result`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [header]: token ? `Bearer ${token}` : "",
+    },
+    body: JSON.stringify({
+      folderPath: pendingAuth.folderPath,
+      sourceFile: pendingAuth.sourceFile,
+      credentialKey: pendingAuth.credentialKey,
+      serverName: pendingAuth.serverName,
+      serverUrl: pendingAuth.serverUrl,
+      clientId,
+      tokens,
+    }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(
+      err.message || `Failed to save credential tokens (${resp.status})`,
+    );
+  }
+
+  return resp.json();
+};
+
+export const readPendingCredentialAuth = (): PendingCredentialAuth | null => {
+  const raw = sessionStorage.getItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed.folderPath === "string" &&
+      typeof parsed.sourceFile === "string" &&
+      typeof parsed.credentialKey === "string" &&
+      typeof parsed.credentialId === "string" &&
+      typeof parsed.serverName === "string" &&
+      typeof parsed.serverUrl === "string" &&
+      typeof parsed.clientId === "string"
+    ) {
+      return parsed;
+    }
+  } catch (error) {
+    console.warn("[CredentialsTab:auth] Invalid pending auth payload:", error);
+  }
+
+  return null;
+};
+
+class CredentialTabOAuthClientProvider extends InspectorOAuthClientProvider {
+  redirectToAuthorization(authorizationUrl: URL) {
+    const opened = window.open(
+      authorizationUrl.toString(),
+      "_blank",
+      "noopener,noreferrer",
+    );
+
+    if (!opened) {
+      throw new Error("Browser blocked the authentication popup");
+    }
+  }
+}
 
 const areStringSetsEqual = (left: Set<string>, right: Set<string>) =>
   left.size === right.size && [...left].every((value) => right.has(value));
@@ -213,6 +313,9 @@ const CredentialsTab = ({
     useState<ProxyToolSelectionCounts>({});
   const [proxySearchQuery, setProxySearchQuery] = useState("");
   const [installingCredentialId, setInstallingCredentialId] = useState<
+    string | null
+  >(null);
+  const [authenticatingCredentialId, setAuthenticatingCredentialId] = useState<
     string | null
   >(null);
 
@@ -852,6 +955,104 @@ const CredentialsTab = ({
       loadCredentials,
       toast,
     ],
+  );
+
+  const handleAuthenticateCredential = useCallback(
+    async (entry: CredentialEntry) => {
+      if (!credentialsFolderPath) {
+        toast({
+          title: "Cannot Authenticate",
+          description: "No credentials folder set",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      if (!entry.serverUrl) {
+        toast({
+          title: "Cannot Authenticate",
+          description: "Missing server URL",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const credentialId = getCredentialIdentity(entry);
+      const pendingAuth: PendingCredentialAuth = {
+        folderPath: credentialsFolderPath,
+        sourceFile: entry.sourceFile,
+        credentialKey: entry.key,
+        credentialId,
+        serverName: entry.serverName,
+        serverUrl: entry.serverUrl,
+        clientId: entry.clientId,
+      };
+
+      console.log(
+        `[CredentialsTab:auth] Starting OAuth for ${entry.serverName}`,
+        pendingAuth,
+      );
+      setAuthenticatingCredentialId(credentialId);
+      sessionStorage.setItem(
+        SESSION_KEYS.PENDING_CREDENTIAL_AUTH,
+        JSON.stringify(pendingAuth),
+      );
+
+      try {
+        if (entry.clientId) {
+          saveClientInformationToSessionStorage({
+            serverUrl: entry.serverUrl,
+            clientInformation: { client_id: entry.clientId },
+            isPreregistered: true,
+          });
+        }
+
+        const provider = new CredentialTabOAuthClientProvider(
+          entry.serverUrl,
+          entry.scopes.join(" "),
+        );
+        const result: AuthResult = await auth(provider, {
+          serverUrl: entry.serverUrl,
+          scope: entry.scopes.join(" ") || undefined,
+        });
+
+        if (result === "AUTHORIZED") {
+          const [tokens, clientInformation] = await Promise.all([
+            provider.tokens(),
+            provider.clientInformation(),
+          ]);
+
+          if (!tokens) {
+            throw new Error("OAuth completed without tokens");
+          }
+
+          await saveCredentialAuthResult({
+            config,
+            pendingAuth,
+            tokens,
+            clientId: clientInformation?.client_id || entry.clientId,
+          });
+
+          sessionStorage.removeItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+          toast({
+            title: "Authenticated",
+            description: `Saved fresh OAuth tokens for ${entry.serverName}`,
+          });
+          loadCredentials();
+        }
+      } catch (error) {
+        console.error("[CredentialsTab:auth] OAuth start failed:", error);
+        sessionStorage.removeItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+        toast({
+          title: "Authentication Failed",
+          description: error instanceof Error ? error.message : String(error),
+          variant: "destructive",
+        });
+      } finally {
+        setAuthenticatingCredentialId(null);
+      }
+    },
+    [config, credentialsFolderPath, loadCredentials, toast],
   );
 
   const closeCredentialNameDialog = useCallback(() => {
@@ -2104,6 +2305,8 @@ const CredentialsTab = ({
                             const installed = isCredentialInstalled(entry);
                             const isInstalling =
                               installingCredentialId === credentialId;
+                            const isAuthenticating =
+                              authenticatingCredentialId === credentialId;
                             return (
                               <>
                                 {installed ? (
@@ -2147,6 +2350,27 @@ const CredentialsTab = ({
                                     Install
                                   </Button>
                                 )}
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 px-2 text-xs"
+                                  onClick={() =>
+                                    handleAuthenticateCredential(entry)
+                                  }
+                                  disabled={
+                                    isAuthenticating ||
+                                    !isEnabled ||
+                                    !entry.serverUrl
+                                  }
+                                  title="Authenticate with OAuth"
+                                >
+                                  {isAuthenticating ? (
+                                    <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                                  ) : (
+                                    <LogIn className="w-3.5 h-3.5 mr-1" />
+                                  )}
+                                  Authenticate
+                                </Button>
                                 <Button
                                   variant="ghost"
                                   size="sm"
@@ -2388,4 +2612,4 @@ const CredentialsTab = ({
 };
 
 export default CredentialsTab;
-export type { RawCredentials, CredentialEntry };
+export type { RawCredentials, CredentialEntry, PendingCredentialAuth };
