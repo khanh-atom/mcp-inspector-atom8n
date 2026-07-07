@@ -589,6 +589,42 @@ const CredentialsTab = ({
     [config, credentialsFolderPath, toast],
   );
 
+  const handleOpenCredentialsFolder = useCallback(async () => {
+    if (!credentialsFolderPath) return;
+
+    try {
+      const baseUrl = getMCPProxyAddress(config);
+      const { token, header } = getMCPProxyAuthToken(config);
+      const resp = await fetch(
+        `${baseUrl}/open-config-file?path=${encodeURIComponent(credentialsFolderPath)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [header]: token ? `Bearer ${token}` : "",
+          },
+        },
+      );
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(
+          err.message || `Failed to open folder (${resp.status})`,
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[CredentialsTab] Failed to open credentials folder:",
+        error,
+      );
+      toast({
+        title: "Failed to open folder",
+        description: error instanceof Error ? error.message : String(error),
+        variant: "destructive",
+      });
+    }
+  }, [config, credentialsFolderPath, toast]);
+
   // [DRAG-DROP] Handle file drop — read content and upload to server into the selected folder
   const handleFileDrop = useCallback(
     async (file: File) => {
@@ -1937,7 +1973,14 @@ const CredentialsTab = ({
               <Pencil className="w-3 h-3" />
             </Button>
             <FolderOpen className="w-3.5 h-3.5 shrink-0" />
-            <span className="truncate">{credentialsFolderPath}</span>
+            <button
+              type="button"
+              className="truncate text-left text-primary hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+              onClick={handleOpenCredentialsFolder}
+              title={`Open ${credentialsFolderPath}`}
+            >
+              {credentialsFolderPath}
+            </button>
             {Object.keys(entriesByFile).length > 0 && (
               <Badge variant="outline" className="text-xs shrink-0">
                 {Object.keys(entriesByFile).length} file(s)
