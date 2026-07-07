@@ -17,7 +17,6 @@ export const SESSION_KEYS = {
   PREREGISTERED_CLIENT_INFORMATION: "mcp_preregistered_client_information",
   SERVER_METADATA: "mcp_server_metadata",
   AUTH_DEBUGGER_STATE: "mcp_auth_debugger_state",
-  PENDING_CREDENTIAL_AUTH: "mcp_pending_credential_auth",
 } as const;
 
 // Generate server-specific session storage keys

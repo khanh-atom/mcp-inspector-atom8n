@@ -21,16 +21,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
-  auth,
-  type AuthResult,
-} from "@modelcontextprotocol/sdk/client/auth.js";
-import type { OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import {
-  InspectorOAuthClientProvider,
-  saveClientInformationToSessionStorage,
-} from "@/lib/auth";
-import { SESSION_KEYS } from "@/lib/constants";
-import {
   Shield,
   Upload,
   RefreshCw,
@@ -97,14 +87,15 @@ interface CredentialTestServerConfig {
   bearerToken?: string;
 }
 
-interface PendingCredentialAuth {
-  folderPath: string;
-  sourceFile: string;
-  credentialKey: string;
-  credentialId: string;
-  serverName: string;
-  serverUrl: string;
-  clientId: string;
+interface CredentialAuthStartResponse {
+  authId: string;
+  authorizationUrl: string;
+}
+
+interface CredentialAuthStatus {
+  status: "pending" | "complete" | "error";
+  error?: string;
+  expiresAt?: number | null;
 }
 
 /** [PROXY] Tool info returned from the credential-server-tools endpoint */
@@ -166,85 +157,6 @@ const getCredentialRecord = (
   entry: Pick<CredentialEntry, "id" | "sourceFile" | "key">,
 ) =>
   rawCredentials?.[getCredentialIdentity(entry)] || rawCredentials?.[entry.key];
-
-export const saveCredentialAuthResult = async ({
-  config,
-  pendingAuth,
-  tokens,
-  clientId,
-}: {
-  config: InspectorConfig;
-  pendingAuth: PendingCredentialAuth;
-  tokens: OAuthTokens;
-  clientId: string;
-}) => {
-  const baseUrl = getMCPProxyAddress(config);
-  const { token, header } = getMCPProxyAuthToken(config);
-  const resp = await fetch(`${baseUrl}/credentials/oauth-result`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      [header]: token ? `Bearer ${token}` : "",
-    },
-    body: JSON.stringify({
-      folderPath: pendingAuth.folderPath,
-      sourceFile: pendingAuth.sourceFile,
-      credentialKey: pendingAuth.credentialKey,
-      serverName: pendingAuth.serverName,
-      serverUrl: pendingAuth.serverUrl,
-      clientId,
-      tokens,
-    }),
-  });
-
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(
-      err.message || `Failed to save credential tokens (${resp.status})`,
-    );
-  }
-
-  return resp.json();
-};
-
-export const readPendingCredentialAuth = (): PendingCredentialAuth | null => {
-  const raw = sessionStorage.getItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
-  if (!raw) return null;
-
-  try {
-    const parsed = JSON.parse(raw);
-    if (
-      parsed &&
-      typeof parsed.folderPath === "string" &&
-      typeof parsed.sourceFile === "string" &&
-      typeof parsed.credentialKey === "string" &&
-      typeof parsed.credentialId === "string" &&
-      typeof parsed.serverName === "string" &&
-      typeof parsed.serverUrl === "string" &&
-      typeof parsed.clientId === "string"
-    ) {
-      return parsed;
-    }
-  } catch (error) {
-    console.warn("[CredentialsTab:auth] Invalid pending auth payload:", error);
-  }
-
-  return null;
-};
-
-class CredentialTabOAuthClientProvider extends InspectorOAuthClientProvider {
-  redirectToAuthorization(authorizationUrl: URL) {
-    const opened = window.open(
-      authorizationUrl.toString(),
-      "_blank",
-      "noopener,noreferrer",
-    );
-
-    if (!opened) {
-      throw new Error("Browser blocked the authentication popup");
-    }
-  }
-}
 
 const areStringSetsEqual = (left: Set<string>, right: Set<string>) =>
   left.size === right.size && [...left].every((value) => right.has(value));
@@ -1072,71 +984,109 @@ const CredentialsTab = ({
       }
 
       const credentialId = getCredentialIdentity(entry);
-      const pendingAuth: PendingCredentialAuth = {
-        folderPath: credentialsFolderPath,
-        sourceFile: entry.sourceFile,
-        credentialKey: entry.key,
-        credentialId,
-        serverName: entry.serverName,
-        serverUrl: entry.serverUrl,
-        clientId: entry.clientId,
-      };
-
       console.log(
         `[CredentialsTab:auth] Starting OAuth for ${entry.serverName}`,
-        pendingAuth,
+        { credentialId, serverUrl: entry.serverUrl },
       );
+      const authWindow = window.open("about:blank", "_blank");
+      if (!authWindow) {
+        toast({
+          title: "Authentication Blocked",
+          description: "Allow popups for this site and try again",
+          variant: "destructive",
+        });
+        return;
+      }
+
       setAuthenticatingCredentialId(credentialId);
-      sessionStorage.setItem(
-        SESSION_KEYS.PENDING_CREDENTIAL_AUTH,
-        JSON.stringify(pendingAuth),
-      );
+      let openedAuthorizationUrl = false;
 
       try {
-        if (entry.clientId) {
-          saveClientInformationToSessionStorage({
-            serverUrl: entry.serverUrl,
-            clientInformation: { client_id: entry.clientId },
-            isPreregistered: true,
-          });
+        try {
+          authWindow.document.write(
+            "<!doctype html><html><body><p>Starting authentication...</p></body></html>",
+          );
+        } catch {
+          // Optional loading text only.
         }
 
-        const provider = new CredentialTabOAuthClientProvider(
-          entry.serverUrl,
-          entry.scopes.join(" "),
-        );
-        const result: AuthResult = await auth(provider, {
-          serverUrl: entry.serverUrl,
-          scope: entry.scopes.join(" ") || undefined,
+        const baseUrl = getMCPProxyAddress(config);
+        const { token, header } = getMCPProxyAuthToken(config);
+        const startResp = await fetch(`${baseUrl}/credentials/auth/start`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [header]: token ? `Bearer ${token}` : "",
+          },
+          body: JSON.stringify({
+            folderPath: credentialsFolderPath,
+            sourceFile: entry.sourceFile,
+            credentialKey: entry.key,
+            serverName: entry.serverName,
+            serverUrl: entry.serverUrl,
+            clientId: entry.clientId || undefined,
+            scopes: entry.scopes,
+          }),
         });
 
-        if (result === "AUTHORIZED") {
-          const [tokens, clientInformation] = await Promise.all([
-            provider.tokens(),
-            provider.clientInformation(),
-          ]);
+        if (!startResp.ok) {
+          const err = await startResp.json().catch(() => ({}));
+          throw new Error(
+            err.message ||
+              `Failed to start authentication (${startResp.status})`,
+          );
+        }
 
-          if (!tokens) {
-            throw new Error("OAuth completed without tokens");
+        const startData =
+          (await startResp.json()) as CredentialAuthStartResponse;
+        authWindow.location.href = startData.authorizationUrl;
+        openedAuthorizationUrl = true;
+
+        const deadline = Date.now() + 5 * 60_000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          const statusResp = await fetch(
+            `${baseUrl}/credentials/auth/status?authId=${encodeURIComponent(startData.authId)}`,
+            {
+              method: "GET",
+              headers: {
+                "Content-Type": "application/json",
+                [header]: token ? `Bearer ${token}` : "",
+              },
+            },
+          );
+
+          if (!statusResp.ok) {
+            const err = await statusResp.json().catch(() => ({}));
+            throw new Error(
+              err.message ||
+                `Failed to check authentication status (${statusResp.status})`,
+            );
           }
 
-          await saveCredentialAuthResult({
-            config,
-            pendingAuth,
-            tokens,
-            clientId: clientInformation?.client_id || entry.clientId,
-          });
+          const statusData = (await statusResp.json()) as CredentialAuthStatus;
+          if (statusData.status === "pending") {
+            continue;
+          }
+          if (statusData.status === "error") {
+            throw new Error(statusData.error || "Authentication failed");
+          }
 
-          sessionStorage.removeItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+          authWindow.close();
           toast({
             title: "Authenticated",
             description: `Saved fresh OAuth tokens for ${entry.serverName}`,
           });
           loadCredentials();
+          return;
         }
+
+        throw new Error("Timed out waiting for authentication callback");
       } catch (error) {
         console.error("[CredentialsTab:auth] OAuth start failed:", error);
-        sessionStorage.removeItem(SESSION_KEYS.PENDING_CREDENTIAL_AUTH);
+        if (!openedAuthorizationUrl) {
+          authWindow.close();
+        }
         toast({
           title: "Authentication Failed",
           description: error instanceof Error ? error.message : String(error),
@@ -2727,4 +2677,4 @@ const CredentialsTab = ({
 };
 
 export default CredentialsTab;
-export type { RawCredentials, CredentialEntry, PendingCredentialAuth };
+export type { RawCredentials, CredentialEntry };

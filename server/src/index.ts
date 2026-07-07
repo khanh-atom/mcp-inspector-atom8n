@@ -22,7 +22,20 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import {
+  discoverAuthorizationServerMetadata,
+  discoverOAuthProtectedResourceMetadata,
+  exchangeAuthorization,
+  registerClient,
+  startAuthorization,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import type {
+  OAuthClientInformation,
+  OAuthClientMetadata,
+  OAuthTokens,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
 import express from "express";
+import http from "node:http";
 import path from "node:path";
 import os from "node:os";
 import { promises as fs } from "node:fs";
@@ -34,7 +47,12 @@ import { exec } from "node:child_process";
 import { findActualExecutable } from "spawn-rx";
 import mcpProxy from "./mcpProxy.js";
 import logger from "./logger.js";
-import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  randomUUID,
+  randomBytes,
+  timingSafeEqual,
+} from "node:crypto";
 
 const DEFAULT_MCP_PROXY_LISTEN_PORT = "6277";
 
@@ -2011,6 +2029,97 @@ interface LocatedCredential {
   credential: CredentialRecord;
 }
 
+interface CredentialOAuthStatus {
+  id: string;
+  status: "pending" | "complete" | "error";
+  credentialKey: string;
+  sourceFile: string;
+  serverName: string;
+  error?: string;
+  authorizationUrl?: string;
+  redirectUri?: string;
+  expiresAt?: number | null;
+}
+
+const CREDENTIAL_OAUTH_CALLBACK_PATH = "/callback";
+const DEFAULT_CREDENTIAL_OAUTH_CALLBACK_PORT = Number(
+  process.env.MCP_CREDENTIAL_OAUTH_CALLBACK_PORT || "8787",
+);
+const DATADOG_MCP_OAUTH_CALLBACK_PORT = Number(
+  process.env.DATADOG_MCP_OAUTH_CALLBACK_PORT || "8787",
+);
+const DATADOG_MCP_OAUTH_CLIENT_ID =
+  process.env.DATADOG_MCP_OAUTH_CLIENT_ID ||
+  "30134ccc-601a-4d47-a48c-e3e80081990e";
+const DATADOG_MCP_OAUTH_WORKSPACE_ID =
+  process.env.DATADOG_MCP_OAUTH_WORKSPACE_ID ||
+  "a0aaa74584d5192108fd97687f8cfe9c";
+const DATADOG_MCP_OAUTH_STATE_ID =
+  process.env.DATADOG_MCP_OAUTH_STATE_ID ||
+  "user-datadog::mcpScope:profile:ZGVmYXVsdA";
+const DATADOG_MCP_OAUTH_SURFACE =
+  process.env.DATADOG_MCP_OAUTH_SURFACE || "mcp_process";
+const credentialOAuthStatuses = new Map<string, CredentialOAuthStatus>();
+
+function isDatadogMcpServerUrl(serverUrl: string): boolean {
+  try {
+    const hostname = new URL(serverUrl).hostname.toLowerCase();
+    return hostname.startsWith("mcp.") && hostname.endsWith(".datadoghq.com");
+  } catch {
+    return false;
+  }
+}
+
+function createPkcePair(): { codeVerifier: string; codeChallenge: string } {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  return { codeVerifier, codeChallenge };
+}
+
+function createDatadogMcpOAuthState(): string {
+  const state = {
+    id: DATADOG_MCP_OAUTH_STATE_ID,
+    owner: { workspaceId: DATADOG_MCP_OAUTH_WORKSPACE_ID },
+    attemptId: randomUUID(),
+    surface: DATADOG_MCP_OAUTH_SURFACE,
+  };
+
+  return Buffer.from(JSON.stringify(state), "utf8").toString("base64url");
+}
+
+function buildDatadogMcpAuthorizationUrl({
+  authorizationEndpoint,
+  redirectUri,
+  resource,
+  state,
+  codeChallenge,
+}: {
+  authorizationEndpoint: string;
+  redirectUri: string;
+  resource: string;
+  state: string;
+  codeChallenge: string;
+}): URL {
+  const authorizationUrl = new URL(authorizationEndpoint);
+  authorizationUrl.search = "";
+  authorizationUrl.searchParams.set("response_type", "code");
+  authorizationUrl.searchParams.set("client_id", DATADOG_MCP_OAUTH_CLIENT_ID);
+  authorizationUrl.searchParams.set("code_challenge", codeChallenge);
+  authorizationUrl.searchParams.set("code_challenge_method", "S256");
+  authorizationUrl.searchParams.set("redirect_uri", redirectUri);
+  authorizationUrl.searchParams.set("state", state);
+  authorizationUrl.searchParams.set("resource", resource);
+
+  const loginUrl = new URL("/account/login", authorizationUrl.origin);
+  loginUrl.searchParams.set(
+    "next",
+    `${authorizationUrl.pathname}${authorizationUrl.search}`,
+  );
+  return loginUrl;
+}
+
 function credentialsStatePath(folderPath?: string): string {
   return path.join(
     path.resolve(
@@ -2249,6 +2358,123 @@ async function readCredentialFile(
       `Credentials file not found or invalid: ${filePath} — ${readErr?.message}`,
     );
   }
+}
+
+async function writeCredentialOAuthTokens({
+  meta,
+  serverName,
+  serverUrl,
+  clientId,
+  tokens,
+  fallbackScopes = [],
+}: {
+  meta: CredentialMeta;
+  serverName: string;
+  serverUrl: string;
+  clientId: string;
+  tokens: OAuthTokens & { expires_at?: number; scopes?: string[] };
+  fallbackScopes?: string[];
+}): Promise<number | null> {
+  if (!tokens.access_token || typeof tokens.access_token !== "string") {
+    throw new Error("'tokens.access_token' is required");
+  }
+
+  const filePath = credentialFilePath(meta);
+  const credentials = await readCredentialFile(meta);
+  const existingCredential = credentials[meta.credentialKey] || {};
+  const scopes =
+    typeof tokens.scope === "string"
+      ? tokens.scope.split(/\s+/).filter(Boolean)
+      : Array.isArray(tokens.scopes)
+        ? tokens.scopes.filter(
+            (scope: unknown): scope is string => typeof scope === "string",
+          )
+        : existingCredential.scopes || fallbackScopes;
+  const expiresAt =
+    typeof tokens.expires_in === "number"
+      ? Date.now() + tokens.expires_in * 1000
+      : typeof tokens.expires_at === "number"
+        ? tokens.expires_at
+        : existingCredential.expires_at || null;
+
+  credentials[meta.credentialKey] = {
+    ...existingCredential,
+    server_name:
+      typeof serverName === "string" && serverName.trim()
+        ? serverName.trim()
+        : existingCredential.server_name || meta.credentialKey.split("|")[0],
+    server_url:
+      typeof serverUrl === "string" && serverUrl.trim()
+        ? serverUrl.trim()
+        : existingCredential.server_url || "",
+    client_id:
+      typeof clientId === "string" && clientId.trim()
+        ? clientId.trim()
+        : existingCredential.client_id || "",
+    access_token: tokens.access_token,
+    expires_at: expiresAt ?? undefined,
+    refresh_token:
+      typeof tokens.refresh_token === "string"
+        ? tokens.refresh_token
+        : existingCredential.refresh_token || "",
+    scopes,
+  };
+
+  await fs.writeFile(filePath, JSON.stringify(credentials, null, 4), "utf8");
+  return expiresAt;
+}
+
+function listenCredentialOAuthCallbackServer(
+  server: http.Server,
+  preferredPort: number,
+): Promise<number> {
+  const listenOnPort = (port: number) =>
+    new Promise<number>((resolve, reject) => {
+      const cleanup = () => {
+        server.off("error", onError);
+      };
+      const onError = (error: NodeJS.ErrnoException) => {
+        cleanup();
+        reject(error);
+      };
+
+      server.once("error", onError);
+      server.listen(port, "localhost", () => {
+        cleanup();
+        const address = server.address();
+        if (address && typeof address === "object") {
+          resolve(address.port);
+          return;
+        }
+        resolve(port);
+      });
+    });
+
+  return listenOnPort(preferredPort).catch((error: NodeJS.ErrnoException) => {
+    if (error?.code === "EADDRINUSE") {
+      logger.warn(
+        `[credentials:auth] Callback port ${preferredPort} is in use; falling back to an ephemeral port`,
+      );
+      return listenOnPort(0);
+    }
+    throw error;
+  });
+}
+
+function completeCredentialOAuthStatus(
+  status: CredentialOAuthStatus,
+  updates: Partial<CredentialOAuthStatus>,
+  callbackServer?: http.Server,
+) {
+  Object.assign(status, updates);
+  callbackServer?.close((error) => {
+    if (error) {
+      logger.warn("[credentials:auth] Error closing callback server:", error);
+    }
+  });
+  setTimeout(() => {
+    credentialOAuthStatuses.delete(status.id);
+  }, 60_000);
 }
 
 async function readCredentialByMeta(
@@ -4205,6 +4431,373 @@ app.post(
   },
 );
 
+// POST /credentials/auth/start — Start a server-side OAuth flow for a credential.
+// The proxy opens a temporary local callback listener, exchanges the callback
+// code server-side, and writes the resulting tokens into the credential file.
+app.post(
+  "/credentials/auth/start",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    const authId = randomUUID();
+    let callbackServer: http.Server | undefined;
+
+    try {
+      const {
+        folderPath: rawFolder,
+        sourceFile,
+        credentialKey,
+        serverName,
+        serverUrl,
+        clientId,
+        scopes,
+        callbackPort,
+      } = req.body;
+
+      if (!rawFolder || !sourceFile || !credentialKey || !serverUrl) {
+        res.status(400).json({
+          error: "Bad Request",
+          message:
+            "'folderPath', 'sourceFile', 'credentialKey', and 'serverUrl' are all required",
+        });
+        return;
+      }
+
+      const meta: CredentialMeta = {
+        folderPath: rawFolder,
+        sourceFile,
+        credentialKey,
+      };
+      const credentialServerName =
+        typeof serverName === "string" && serverName.trim()
+          ? serverName.trim()
+          : credentialKey.split("|")[0];
+      const requestedScopes = Array.isArray(scopes)
+        ? scopes.filter(
+            (scope: unknown): scope is string => typeof scope === "string",
+          )
+        : [];
+      const isDatadogMcpAuth = isDatadogMcpServerUrl(serverUrl);
+      const status: CredentialOAuthStatus = {
+        id: authId,
+        status: "pending",
+        credentialKey,
+        sourceFile,
+        serverName: credentialServerName,
+      };
+      credentialOAuthStatuses.set(authId, status);
+      const scheduleAuthTimeout = () => {
+        setTimeout(() => {
+          const current = credentialOAuthStatuses.get(authId);
+          if (current?.status === "pending") {
+            completeCredentialOAuthStatus(
+              current,
+              {
+                status: "error",
+                error: "Timed out waiting for OAuth callback",
+              },
+              callbackServer,
+            );
+          }
+        }, 5 * 60_000);
+      };
+
+      let callbackHandled = false;
+      let resolveCallbackReady: (value: {
+        server: http.Server;
+        redirectUri: string;
+      }) => void;
+      let rejectCallbackReady: (reason?: unknown) => void;
+      const callbackReady = new Promise<{
+        server: http.Server;
+        redirectUri: string;
+      }>((resolve, reject) => {
+        resolveCallbackReady = resolve;
+        rejectCallbackReady = reject;
+      });
+      let authServerUrl: string | URL = serverUrl;
+      let oauthMetadata: Awaited<
+        ReturnType<typeof discoverAuthorizationServerMetadata>
+      >;
+      let clientInformation: OAuthClientInformation | null = null;
+      let oauthState = "";
+      let codeVerifier = "";
+      let resource: URL | undefined;
+
+      callbackServer = http.createServer((callbackReq, callbackRes) => {
+        void (async () => {
+          try {
+            const redirectUri = status.redirectUri;
+            if (!redirectUri) {
+              callbackRes.writeHead(503, { "Content-Type": "text/plain" });
+              callbackRes.end("OAuth callback server is not ready");
+              return;
+            }
+
+            const callbackUrl = new URL(callbackReq.url || "/", redirectUri);
+            if (callbackUrl.pathname !== CREDENTIAL_OAUTH_CALLBACK_PATH) {
+              callbackRes.writeHead(404, { "Content-Type": "text/plain" });
+              callbackRes.end("Not Found");
+              return;
+            }
+
+            if (callbackHandled) {
+              callbackRes.writeHead(409, { "Content-Type": "text/plain" });
+              callbackRes.end("OAuth callback already handled");
+              return;
+            }
+            callbackHandled = true;
+
+            const oauthError = callbackUrl.searchParams.get("error");
+            if (oauthError) {
+              const description =
+                callbackUrl.searchParams.get("error_description") || oauthError;
+              callbackRes.writeHead(400, { "Content-Type": "text/plain" });
+              callbackRes.end(description);
+              completeCredentialOAuthStatus(
+                status,
+                { status: "error", error: description },
+                callbackServer,
+              );
+              return;
+            }
+
+            const code = callbackUrl.searchParams.get("code");
+            const callbackState = callbackUrl.searchParams.get("state");
+            if (!code || callbackState !== oauthState) {
+              const message = !code
+                ? "Missing OAuth authorization code"
+                : "OAuth state mismatch";
+              callbackRes.writeHead(400, { "Content-Type": "text/plain" });
+              callbackRes.end(message);
+              completeCredentialOAuthStatus(
+                status,
+                { status: "error", error: message },
+                callbackServer,
+              );
+              return;
+            }
+
+            if (!clientInformation || !codeVerifier) {
+              throw new Error("OAuth flow is not initialized");
+            }
+
+            const tokens = await exchangeAuthorization(authServerUrl, {
+              metadata: oauthMetadata ?? undefined,
+              clientInformation,
+              authorizationCode: code,
+              codeVerifier,
+              redirectUri,
+              resource,
+              fetchFn: fetch as any,
+            });
+            const expiresAt = await writeCredentialOAuthTokens({
+              meta,
+              serverName: credentialServerName,
+              serverUrl,
+              clientId: clientInformation.client_id,
+              tokens,
+              fallbackScopes: requestedScopes,
+            });
+
+            callbackRes.writeHead(200, { "Content-Type": "text/html" });
+            callbackRes.end(
+              "<!doctype html><html><body><h1>Authentication complete</h1><p>You may close this window.</p></body></html>",
+            );
+            completeCredentialOAuthStatus(
+              status,
+              { status: "complete", expiresAt },
+              callbackServer,
+            );
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            logger.error("[credentials:auth] Callback exchange failed:", error);
+            callbackRes.writeHead(500, { "Content-Type": "text/plain" });
+            callbackRes.end(message);
+            completeCredentialOAuthStatus(
+              status,
+              { status: "error", error: message },
+              callbackServer,
+            );
+          }
+        })();
+      });
+
+      const preferredCallbackPort =
+        typeof callbackPort === "number" && Number.isFinite(callbackPort)
+          ? callbackPort
+          : isDatadogMcpAuth
+            ? DATADOG_MCP_OAUTH_CALLBACK_PORT
+            : DEFAULT_CREDENTIAL_OAUTH_CALLBACK_PORT;
+      listenCredentialOAuthCallbackServer(callbackServer, preferredCallbackPort)
+        .then((actualPort) => {
+          const redirectUri = `http://localhost:${actualPort}${CREDENTIAL_OAUTH_CALLBACK_PATH}`;
+          status.redirectUri = redirectUri;
+          resolveCallbackReady({ server: callbackServer!, redirectUri });
+        })
+        .catch((error) => {
+          rejectCallbackReady(error);
+        });
+
+      const { redirectUri } = await callbackReady;
+      let resourceMetadata;
+      authServerUrl = serverUrl;
+      try {
+        resourceMetadata = await discoverOAuthProtectedResourceMetadata(
+          serverUrl,
+          undefined,
+          fetch as any,
+        );
+        if (resourceMetadata?.authorization_servers?.length) {
+          authServerUrl = resourceMetadata.authorization_servers[0];
+        }
+      } catch (error) {
+        logger.info(
+          "[credentials:auth] Protected resource metadata unavailable; falling back to server URL",
+          error,
+        );
+      }
+
+      resource = resourceMetadata?.resource
+        ? new URL(resourceMetadata.resource)
+        : new URL(serverUrl);
+      oauthMetadata = await discoverAuthorizationServerMetadata(authServerUrl, {
+        fetchFn: fetch as any,
+      });
+
+      if (isDatadogMcpAuth) {
+        const actualCallbackPort = Number(new URL(redirectUri).port);
+        if (actualCallbackPort !== DATADOG_MCP_OAUTH_CALLBACK_PORT) {
+          throw new Error(
+            `Datadog MCP authentication requires callback port ${DATADOG_MCP_OAUTH_CALLBACK_PORT}; port ${preferredCallbackPort} was unavailable`,
+          );
+        }
+
+        if (!oauthMetadata?.authorization_endpoint) {
+          throw new Error(
+            "Datadog OAuth metadata is missing authorization_endpoint",
+          );
+        }
+
+        clientInformation = {
+          client_id: DATADOG_MCP_OAUTH_CLIENT_ID,
+        };
+        const pkce = createPkcePair();
+        codeVerifier = pkce.codeVerifier;
+        oauthState = createDatadogMcpOAuthState();
+
+        const authorizationUrl = buildDatadogMcpAuthorizationUrl({
+          authorizationEndpoint: oauthMetadata.authorization_endpoint,
+          redirectUri,
+          resource: resource?.toString() || serverUrl,
+          state: oauthState,
+          codeChallenge: pkce.codeChallenge,
+        });
+
+        status.authorizationUrl = authorizationUrl.toString();
+        status.redirectUri = redirectUri;
+        logger.info(
+          "[credentials:auth] Starting Datadog MCP OAuth authorization with Datadog-compatible login URL",
+        );
+        res.json({
+          success: true,
+          authId,
+          authorizationUrl: status.authorizationUrl,
+          redirectUri,
+        });
+        scheduleAuthTimeout();
+        return;
+      }
+
+      const clientMetadata: OAuthClientMetadata = {
+        redirect_uris: [redirectUri],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        client_name: "MCP Inspector",
+        client_uri: "https://github.com/modelcontextprotocol/inspector",
+        scope: requestedScopes.join(" "),
+      };
+
+      if (typeof clientId === "string" && clientId.trim()) {
+        clientInformation = { client_id: clientId.trim() };
+        logger.info(
+          "[credentials:auth] Using existing credential client_id for OAuth authorization",
+        );
+      } else {
+        clientInformation = await registerClient(authServerUrl, {
+          metadata: oauthMetadata ?? undefined,
+          clientMetadata,
+          fetchFn: fetch as any,
+        });
+        logger.info(
+          "[credentials:auth] Registered OAuth client for credential authorization",
+        );
+      }
+
+      oauthState = randomBytes(32).toString("base64url");
+      const authorization = await startAuthorization(authServerUrl, {
+        metadata: oauthMetadata ?? undefined,
+        clientInformation,
+        redirectUrl: redirectUri,
+        scope: requestedScopes.join(" ") || undefined,
+        state: oauthState,
+        resource,
+      });
+      codeVerifier = authorization.codeVerifier;
+
+      status.authorizationUrl = authorization.authorizationUrl.toString();
+      status.redirectUri = redirectUri;
+      res.json({
+        success: true,
+        authId,
+        authorizationUrl: status.authorizationUrl,
+        redirectUri,
+      });
+
+      scheduleAuthTimeout();
+    } catch (error: any) {
+      callbackServer?.close();
+      credentialOAuthStatuses.delete(authId);
+      logger.error("[credentials:auth] Failed to start OAuth flow:", error);
+      res.status(500).json({
+        error: "OAuth Start Failed",
+        message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// GET /credentials/auth/status — Poll server-side credential OAuth completion.
+app.get(
+  "/credentials/auth/status",
+  originValidationMiddleware,
+  authMiddleware,
+  (req, res) => {
+    const authId = req.query.authId;
+    if (typeof authId !== "string" || !authId) {
+      res.status(400).json({
+        error: "Bad Request",
+        message: "'authId' query parameter is required",
+      });
+      return;
+    }
+
+    const status = credentialOAuthStatuses.get(authId);
+    if (!status) {
+      res.status(404).json({
+        error: "Not Found",
+        message: `OAuth flow '${authId}' was not found`,
+      });
+      return;
+    }
+
+    res.json(status);
+  },
+);
+
 // POST /credentials/oauth-result — Persist freshly authenticated OAuth tokens
 // into the selected credential entry.
 app.post(
@@ -4236,65 +4829,18 @@ app.post(
         return;
       }
 
-      if (!tokens.access_token || typeof tokens.access_token !== "string") {
-        res.status(400).json({
-          error: "Bad Request",
-          message: "'tokens.access_token' is required",
-        });
-        return;
-      }
-
       const meta: CredentialMeta = {
         folderPath: rawFolder,
         sourceFile,
         credentialKey,
       };
-      const filePath = credentialFilePath(meta);
-      const credentials = await readCredentialFile(meta);
-      const existingCredential = credentials[credentialKey] || {};
-      const scopes =
-        typeof tokens.scope === "string"
-          ? tokens.scope.split(/\s+/).filter(Boolean)
-          : Array.isArray(tokens.scopes)
-            ? tokens.scopes.filter(
-                (scope: unknown): scope is string => typeof scope === "string",
-              )
-            : existingCredential.scopes || [];
-      const expiresAt =
-        typeof tokens.expires_in === "number"
-          ? Date.now() + tokens.expires_in * 1000
-          : typeof tokens.expires_at === "number"
-            ? tokens.expires_at
-            : existingCredential.expires_at || null;
-
-      credentials[credentialKey] = {
-        ...existingCredential,
-        server_name:
-          typeof serverName === "string" && serverName.trim()
-            ? serverName.trim()
-            : existingCredential.server_name || credentialKey.split("|")[0],
-        server_url:
-          typeof serverUrl === "string" && serverUrl.trim()
-            ? serverUrl.trim()
-            : existingCredential.server_url || "",
-        client_id:
-          typeof clientId === "string" && clientId.trim()
-            ? clientId.trim()
-            : existingCredential.client_id || "",
-        access_token: tokens.access_token,
-        expires_at: expiresAt,
-        refresh_token:
-          typeof tokens.refresh_token === "string"
-            ? tokens.refresh_token
-            : existingCredential.refresh_token || "",
-        scopes,
-      };
-
-      await fs.writeFile(
-        filePath,
-        JSON.stringify(credentials, null, 4),
-        "utf8",
-      );
+      const expiresAt = await writeCredentialOAuthTokens({
+        meta,
+        serverName,
+        serverUrl,
+        clientId,
+        tokens,
+      });
 
       logger.info(
         `[credentials:oauth-result] Saved OAuth tokens for '${credentialKey}' in ${sourceFile}`,
