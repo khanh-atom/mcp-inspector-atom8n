@@ -25,7 +25,6 @@
     "cli"
   ],
   "scripts": {
-    "publish": "npm run bump-version && npm publish --access public",
     "build": "npm run build-server && npm run build-client && npm run build-cli",
     "build-server": "cd server && npm run build",
     "build-client": "cd client && npm run build",
@@ -46,9 +45,9 @@
     "prettier-check": "prettier --check .",
     "lint": "prettier --check . && cd client && npm run lint",
     "prepare": "husky",
-    "prepack": "npm run build && npm login",
+    "prepack": "npm run build",
     "publish-all": "npm publish --workspaces --access public && npm publish --access public",
-    "release:patch": "npm run bump-version && npm publish --access public",
+    "release": "npm run bump-version && npm publish --access public",
     "bump-version": "node .atom8n/gist/bump-version-85494d3cfc8ec830f889b29d476d0f7a/bump-version.mjs",
     "update-version": "node scripts/update-version.js",
     "check-version": "node scripts/check-version-consistency.js"
