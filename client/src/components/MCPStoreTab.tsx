@@ -126,7 +126,7 @@ const ALL_MCP_CONFIGS: MCPConfigDef[] = [
   {
     name: "Claude",
     configPath: "~/.claude.json",
-    icon: "/claude.svg",
+    icon: "/claude.ico",
     matchKey: ".claude.json",
   },
   {

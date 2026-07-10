@@ -1565,7 +1565,7 @@ const App = () => {
                 }`}
                 title="Claude"
               >
-                <img src="/claude.svg" alt="Claude" className="w-5 h-5" />
+                <img src="/claude.ico" alt="Claude" className="w-5 h-5" />
               </button>
               <button
                 onClick={() => {

@@ -766,7 +766,7 @@ const Sidebar = ({
                   {isLoadingDefault ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
-                    <img src="/claude.svg" alt="Claude" className="w-4 h-4" />
+                    <img src="/claude.ico" alt="Claude" className="w-4 h-4" />
                   )}
                   Claude
                   {configCounts["~/.claude.json"] != null
