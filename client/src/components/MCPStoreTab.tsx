@@ -124,6 +124,12 @@ const ALL_MCP_CONFIGS: MCPConfigDef[] = [
     matchKey: "antigravity",
   },
   {
+    name: "Claude",
+    configPath: "~/.claude.json",
+    icon: "/claude.svg",
+    matchKey: ".claude.json",
+  },
+  {
     name: "Codex",
     configPath: "~/.codex/config.toml",
     icon: "/codex.png",
@@ -218,35 +224,16 @@ const MCPStoreTab = ({
     icon: string;
   } | null>(() => {
     if (!configFilePath) return null;
-    if (configFilePath.includes("cursor")) {
-      return {
-        name: "Cursor",
-        configPath: configFilePath,
-        icon: "/cursor.svg",
-      };
-    }
-    if (configFilePath.includes("antigravity")) {
-      return {
-        name: "Antigravity",
-        configPath: configFilePath,
-        icon: "/antigravity.png",
-      };
-    }
-    if (configFilePath.includes("codex")) {
-      return {
-        name: "Codex",
-        configPath: configFilePath,
-        icon: "/codex.png",
-      };
-    }
-    if (configFilePath.includes("opencode")) {
-      return {
-        name: "OpenCode",
-        configPath: configFilePath,
-        icon: "/opencode.svg",
-      };
-    }
-    return null;
+    const currentConfig = ALL_MCP_CONFIGS.find((cfg) =>
+      configFilePath.includes(cfg.matchKey),
+    );
+    return currentConfig
+      ? {
+          name: currentConfig.name,
+          configPath: configFilePath,
+          icon: currentConfig.icon,
+        }
+      : null;
   }, [configFilePath]);
   const { toast } = useToast();
 
@@ -428,7 +415,7 @@ const MCPStoreTab = ({
 
       // Fetch servers from all enabled cross-config sources
       for (const cfgSource of configBasedSources) {
-        if (!configSourcesEnabled[cfgSource.name]) continue;
+        if (configSourcesEnabled[cfgSource.name] === false) continue;
         try {
           const baseUrl = getMCPProxyAddress(config);
           const { token, header } = getMCPProxyAuthToken(config);

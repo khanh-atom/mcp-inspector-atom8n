@@ -1463,6 +1463,10 @@ function expandTildePath(rawPath: string): string {
   return rawPath;
 }
 
+function isClaudeConfigPath(targetPath: string): boolean {
+  return path.basename(targetPath) === ".claude.json";
+}
+
 // Returns the default Cursor MCP configuration from the user's home directory
 // Default path: <home>/.cursor/mcp.json (cross-platform)
 app.get(
@@ -1546,6 +1550,31 @@ app.get(
         });
       } catch (readErr: any) {
         if (readErr?.code === "ENOENT") {
+          if (isClaudeConfigPath(targetPath)) {
+            try {
+              const defaultConfig = { mcpServers: {} };
+              await fs.writeFile(
+                targetPath,
+                JSON.stringify(defaultConfig, null, 2),
+                "utf8",
+              );
+              console.log(
+                `[mcp-config] Auto-created Claude config at ${targetPath}`,
+              );
+              res.json({
+                path: targetPath,
+                config: defaultConfig,
+                serverCount: 0,
+              });
+              return;
+            } catch (createErr) {
+              console.error(
+                "[mcp-config] Failed to auto-create Claude config:",
+                createErr,
+              );
+            }
+          }
+
           // Auto-create OpenCode config file if it doesn't exist
           if (targetPath.includes("opencode")) {
             try {
@@ -1868,6 +1897,7 @@ app.post(
       } else {
         // OpenCode uses "mcp" key; detect by reading existing file or path pattern
         const isOpenCode = targetPath.includes("opencode");
+        const isClaude = isClaudeConfigPath(targetPath);
         let updatedConfig: Record<string, unknown>;
 
         if (isOpenCode) {
@@ -1911,6 +1941,30 @@ app.post(
             }
           }
           existingConfig["mcp"] = openCodeServers;
+          updatedConfig = existingConfig;
+        } else if (isClaude) {
+          // Claude Code stores MCP servers in ~/.claude.json alongside other state.
+          // Preserve those fields and replace only the top-level mcpServers object.
+          let existingConfig: Record<string, unknown> = {};
+          try {
+            const existingContent = await fs.readFile(targetPath, "utf8");
+            const parsed = JSON.parse(existingContent) as unknown;
+            if (
+              !parsed ||
+              typeof parsed !== "object" ||
+              Array.isArray(parsed)
+            ) {
+              throw new Error("Claude config root must be a JSON object");
+            }
+            existingConfig = parsed as Record<string, unknown>;
+          } catch (err: any) {
+            if (err?.code !== "ENOENT") {
+              throw new Error(
+                `Invalid JSON in Claude configuration file at ${targetPath}: ${err?.message || String(err)}`,
+              );
+            }
+          }
+          existingConfig["mcpServers"] = servers;
           updatedConfig = existingConfig;
         } else {
           updatedConfig = { mcpServers: servers };

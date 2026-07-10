@@ -1554,6 +1554,21 @@ const App = () => {
               </button>
               <button
                 onClick={() => {
+                  setActiveConfigPath("~/.claude.json");
+                  localStorage.setItem("activeConfigPath", "~/.claude.json");
+                  setConfigRefreshKey((k) => k + 1);
+                }}
+                className={`p-1.5 rounded hover:bg-muted transition-colors ${
+                  activeConfigPath === "~/.claude.json"
+                    ? "ring-2 ring-green-500"
+                    : ""
+                }`}
+                title="Claude"
+              >
+                <img src="/claude.svg" alt="Claude" className="w-5 h-5" />
+              </button>
+              <button
+                onClick={() => {
                   setActiveConfigPath("~/.codex/config.toml");
                   localStorage.setItem(
                     "activeConfigPath",

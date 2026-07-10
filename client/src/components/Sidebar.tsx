@@ -309,6 +309,7 @@ const Sidebar = ({
   const CONFIG_PATHS = [
     "~/.cursor/mcp.json",
     "~/.gemini/antigravity/mcp_config.json",
+    "~/.claude.json",
     "~/.codex/config.toml",
     "~/.config/opencode/opencode.json",
   ];
@@ -755,6 +756,27 @@ const Sidebar = ({
                   variant="outline"
                   size="sm"
                   onClick={() => {
+                    setActiveConfigPath("~/.claude.json");
+                    localStorage.setItem("activeConfigPath", "~/.claude.json");
+                    loadDefaultConfig("~/.claude.json");
+                  }}
+                  disabled={isLoadingDefault}
+                  className={`${configBtnClass} ${activeConfigPath === "~/.claude.json" ? "ring-2 ring-green-500" : ""}`}
+                >
+                  {isLoadingDefault ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <img src="/claude.svg" alt="Claude" className="w-4 h-4" />
+                  )}
+                  Claude
+                  {configCounts["~/.claude.json"] != null
+                    ? ` (${configCounts["~/.claude.json"]})`
+                    : ""}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
                     setActiveConfigPath("~/.codex/config.toml");
                     localStorage.setItem(
                       "activeConfigPath",
@@ -835,7 +857,7 @@ const Sidebar = ({
                     }
                   }}
                   disabled={isLoadingDefault}
-                  className={`${configBtnClass} ${activeConfigPath && activeConfigPath !== "~/.cursor/mcp.json" && activeConfigPath !== "~/.gemini/antigravity/mcp_config.json" && activeConfigPath !== "~/.codex/config.toml" && activeConfigPath !== "~/.config/opencode/opencode.json" ? "ring-2 ring-green-500" : ""}`}
+                  className={`${configBtnClass} ${activeConfigPath && !CONFIG_PATHS.includes(activeConfigPath) ? "ring-2 ring-green-500" : ""}`}
                 >
                   {isLoadingDefault ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -844,11 +866,7 @@ const Sidebar = ({
                   )}
                   Custom
                   {activeConfigPath &&
-                  activeConfigPath !== "~/.cursor/mcp.json" &&
-                  activeConfigPath !==
-                    "~/.gemini/antigravity/mcp_config.json" &&
-                  activeConfigPath !== "~/.codex/config.toml" &&
-                  activeConfigPath !== "~/.config/opencode/opencode.json" &&
+                  !CONFIG_PATHS.includes(activeConfigPath) &&
                   configCounts[activeConfigPath] != null
                     ? ` (${configCounts[activeConfigPath]})`
                     : ""}
