@@ -55,6 +55,11 @@ import {
 } from "node:crypto";
 
 const DEFAULT_MCP_PROXY_LISTEN_PORT = "6277";
+const PORT = parseInt(
+  process.env.SERVER_PORT || DEFAULT_MCP_PROXY_LISTEN_PORT,
+  10,
+);
+const HOST = process.env.HOST || "localhost";
 
 const defaultEnvironment = {
   ...getDefaultEnvironment(),
@@ -2045,9 +2050,6 @@ const CREDENTIAL_OAUTH_CALLBACK_PATH = "/callback";
 const DEFAULT_CREDENTIAL_OAUTH_CALLBACK_PORT = Number(
   process.env.MCP_CREDENTIAL_OAUTH_CALLBACK_PORT || "8787",
 );
-const DATADOG_MCP_OAUTH_CALLBACK_PORT = Number(
-  process.env.DATADOG_MCP_OAUTH_CALLBACK_PORT || "8787",
-);
 const DATADOG_MCP_OAUTH_CLIENT_ID =
   process.env.DATADOG_MCP_OAUTH_CLIENT_ID ||
   "30134ccc-601a-4d47-a48c-e3e80081990e";
@@ -2060,6 +2062,30 @@ const DATADOG_MCP_OAUTH_STATE_ID =
 const DATADOG_MCP_OAUTH_SURFACE =
   process.env.DATADOG_MCP_OAUTH_SURFACE || "mcp_process";
 const credentialOAuthStatuses = new Map<string, CredentialOAuthStatus>();
+
+interface CredentialOAuthFlow {
+  status: CredentialOAuthStatus;
+  meta: CredentialMeta;
+  credentialServerName: string;
+  serverUrl: string;
+  requestedScopes: string[];
+  authServerUrl: string | URL;
+  oauthMetadata: Awaited<
+    ReturnType<typeof discoverAuthorizationServerMetadata>
+  >;
+  clientInformation: OAuthClientInformation;
+  codeVerifier: string;
+  redirectUri: string;
+  resource?: URL;
+  callbackServer?: http.Server;
+  callbackHandled: boolean;
+}
+
+const credentialOAuthFlowsByState = new Map<string, CredentialOAuthFlow>();
+
+function credentialOAuthCallbackRedirectUri(): string {
+  return `http://localhost:${PORT}${CREDENTIAL_OAUTH_CALLBACK_PATH}`;
+}
 
 function isDatadogMcpServerUrl(serverUrl: string): boolean {
   try {
@@ -2467,6 +2493,11 @@ function completeCredentialOAuthStatus(
   callbackServer?: http.Server,
 ) {
   Object.assign(status, updates);
+  for (const [state, flow] of credentialOAuthFlowsByState) {
+    if (flow.status.id === status.id) {
+      credentialOAuthFlowsByState.delete(state);
+    }
+  }
   callbackServer?.close((error) => {
     if (error) {
       logger.warn("[credentials:auth] Error closing callback server:", error);
@@ -4431,6 +4462,101 @@ app.post(
   },
 );
 
+// GET /callback — Browser redirect target for credential OAuth flows that use
+// the Inspector server itself as the callback listener.
+app.get(
+  CREDENTIAL_OAUTH_CALLBACK_PATH,
+  originValidationMiddleware,
+  async (req, res) => {
+    const state = getQueryString(req.query.state);
+    if (!state) {
+      res.status(400).type("text/plain").send("Missing OAuth state");
+      return;
+    }
+
+    const flow = credentialOAuthFlowsByState.get(state);
+    if (!flow) {
+      res
+        .status(400)
+        .type("text/plain")
+        .send("OAuth flow was not found or has expired");
+      return;
+    }
+
+    if (flow.callbackHandled) {
+      res.status(409).type("text/plain").send("OAuth callback already handled");
+      return;
+    }
+    flow.callbackHandled = true;
+
+    const oauthError = getQueryString(req.query.error);
+    if (oauthError) {
+      const description =
+        getQueryString(req.query.error_description) || oauthError;
+      completeCredentialOAuthStatus(
+        flow.status,
+        { status: "error", error: description },
+        flow.callbackServer,
+      );
+      res.status(400).type("text/plain").send(description);
+      return;
+    }
+
+    const code = getQueryString(req.query.code);
+    if (!code) {
+      const message = "Missing OAuth authorization code";
+      completeCredentialOAuthStatus(
+        flow.status,
+        { status: "error", error: message },
+        flow.callbackServer,
+      );
+      res.status(400).type("text/plain").send(message);
+      return;
+    }
+
+    try {
+      const tokens = await exchangeAuthorization(flow.authServerUrl, {
+        metadata: flow.oauthMetadata ?? undefined,
+        clientInformation: flow.clientInformation,
+        authorizationCode: code,
+        codeVerifier: flow.codeVerifier,
+        redirectUri: flow.redirectUri,
+        resource: flow.resource,
+        fetchFn: fetch as any,
+      });
+      const expiresAt = await writeCredentialOAuthTokens({
+        meta: flow.meta,
+        serverName: flow.credentialServerName,
+        serverUrl: flow.serverUrl,
+        clientId: flow.clientInformation.client_id,
+        tokens,
+        fallbackScopes: flow.requestedScopes,
+      });
+
+      completeCredentialOAuthStatus(
+        flow.status,
+        { status: "complete", expiresAt },
+        flow.callbackServer,
+      );
+      res
+        .status(200)
+        .type("html")
+        .send(
+          "<!doctype html><html><body><h1>Authentication complete</h1><p>You may close this window.</p></body></html>",
+        );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error("[credentials:auth] Callback exchange failed:", error);
+      completeCredentialOAuthStatus(
+        flow.status,
+        { status: "error", error: message },
+        flow.callbackServer,
+      );
+      res.status(500).type("text/plain").send(message);
+    }
+  },
+);
+
 // POST /credentials/auth/start — Start a server-side OAuth flow for a credential.
 // The proxy opens a temporary local callback listener, exchanges the callback
 // code server-side, and writes the resulting tokens into the credential file.
@@ -4524,6 +4650,86 @@ app.post(
       let oauthState = "";
       let codeVerifier = "";
       let resource: URL | undefined;
+
+      if (isDatadogMcpAuth) {
+        const redirectUri = credentialOAuthCallbackRedirectUri();
+        status.redirectUri = redirectUri;
+        let resourceMetadata;
+        authServerUrl = serverUrl;
+        try {
+          resourceMetadata = await discoverOAuthProtectedResourceMetadata(
+            serverUrl,
+            undefined,
+            fetch as any,
+          );
+          if (resourceMetadata?.authorization_servers?.length) {
+            authServerUrl = resourceMetadata.authorization_servers[0];
+          }
+        } catch (error) {
+          logger.info(
+            "[credentials:auth] Protected resource metadata unavailable; falling back to server URL",
+            error,
+          );
+        }
+
+        resource = resourceMetadata?.resource
+          ? new URL(resourceMetadata.resource)
+          : new URL(serverUrl);
+        oauthMetadata = await discoverAuthorizationServerMetadata(
+          authServerUrl,
+          {
+            fetchFn: fetch as any,
+          },
+        );
+
+        if (!oauthMetadata?.authorization_endpoint) {
+          throw new Error(
+            "Datadog OAuth metadata is missing authorization_endpoint",
+          );
+        }
+
+        const datadogClientInformation: OAuthClientInformation = {
+          client_id: DATADOG_MCP_OAUTH_CLIENT_ID,
+        };
+        const pkce = createPkcePair();
+        oauthState = createDatadogMcpOAuthState();
+
+        credentialOAuthFlowsByState.set(oauthState, {
+          status,
+          meta,
+          credentialServerName,
+          serverUrl,
+          requestedScopes,
+          authServerUrl,
+          oauthMetadata,
+          clientInformation: datadogClientInformation,
+          codeVerifier: pkce.codeVerifier,
+          redirectUri,
+          resource,
+          callbackHandled: false,
+        });
+
+        const authorizationUrl = buildDatadogMcpAuthorizationUrl({
+          authorizationEndpoint: oauthMetadata.authorization_endpoint,
+          redirectUri,
+          resource: resource?.toString() || serverUrl,
+          state: oauthState,
+          codeChallenge: pkce.codeChallenge,
+        });
+
+        status.authorizationUrl = authorizationUrl.toString();
+        logger.info(
+          `[credentials:auth] Starting Datadog MCP OAuth authorization with callback ${redirectUri}`,
+        );
+        res.json({
+          success: true,
+          authId,
+          authorizationUrl: status.authorizationUrl,
+          redirectUri,
+        });
+        scheduleAuthTimeout();
+        return;
+      }
 
       callbackServer = http.createServer((callbackReq, callbackRes) => {
         void (async () => {
@@ -4628,9 +4834,7 @@ app.post(
       const preferredCallbackPort =
         typeof callbackPort === "number" && Number.isFinite(callbackPort)
           ? callbackPort
-          : isDatadogMcpAuth
-            ? DATADOG_MCP_OAUTH_CALLBACK_PORT
-            : DEFAULT_CREDENTIAL_OAUTH_CALLBACK_PORT;
+          : DEFAULT_CREDENTIAL_OAUTH_CALLBACK_PORT;
       listenCredentialOAuthCallbackServer(callbackServer, preferredCallbackPort)
         .then((actualPort) => {
           const redirectUri = `http://localhost:${actualPort}${CREDENTIAL_OAUTH_CALLBACK_PATH}`;
@@ -4666,50 +4870,6 @@ app.post(
       oauthMetadata = await discoverAuthorizationServerMetadata(authServerUrl, {
         fetchFn: fetch as any,
       });
-
-      if (isDatadogMcpAuth) {
-        const actualCallbackPort = Number(new URL(redirectUri).port);
-        if (actualCallbackPort !== DATADOG_MCP_OAUTH_CALLBACK_PORT) {
-          throw new Error(
-            `Datadog MCP authentication requires callback port ${DATADOG_MCP_OAUTH_CALLBACK_PORT}; port ${preferredCallbackPort} was unavailable`,
-          );
-        }
-
-        if (!oauthMetadata?.authorization_endpoint) {
-          throw new Error(
-            "Datadog OAuth metadata is missing authorization_endpoint",
-          );
-        }
-
-        clientInformation = {
-          client_id: DATADOG_MCP_OAUTH_CLIENT_ID,
-        };
-        const pkce = createPkcePair();
-        codeVerifier = pkce.codeVerifier;
-        oauthState = createDatadogMcpOAuthState();
-
-        const authorizationUrl = buildDatadogMcpAuthorizationUrl({
-          authorizationEndpoint: oauthMetadata.authorization_endpoint,
-          redirectUri,
-          resource: resource?.toString() || serverUrl,
-          state: oauthState,
-          codeChallenge: pkce.codeChallenge,
-        });
-
-        status.authorizationUrl = authorizationUrl.toString();
-        status.redirectUri = redirectUri;
-        logger.info(
-          "[credentials:auth] Starting Datadog MCP OAuth authorization with Datadog-compatible login URL",
-        );
-        res.json({
-          success: true,
-          authId,
-          authorizationUrl: status.authorizationUrl,
-          redirectUri,
-        });
-        scheduleAuthTimeout();
-        return;
-      }
 
       const clientMetadata: OAuthClientMetadata = {
         redirect_uris: [redirectUri],
@@ -5012,12 +5172,6 @@ app.post(
     }
   },
 );
-const PORT = parseInt(
-  process.env.SERVER_PORT || DEFAULT_MCP_PROXY_LISTEN_PORT,
-  10,
-);
-const HOST = process.env.HOST || "localhost";
-
 const server = app.listen(PORT, HOST);
 server.on("listening", () => {
   logger.info(`⚙️ Proxy server listening on ${HOST}:${PORT}`);
