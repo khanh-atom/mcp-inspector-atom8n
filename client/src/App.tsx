@@ -69,7 +69,6 @@ import {
   DialogClose,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import AuthDebugger from "./components/AuthDebugger";
 import ConsoleTab from "./components/ConsoleTab";
 import HistoryAndNotifications from "./components/HistoryAndNotifications";
@@ -244,19 +243,6 @@ const App = () => {
   // [CREDENTIALS] State for credential management
   const [credentialsFolderPath, setCredentialsFolderPath] = useState<string>(
     () => localStorage.getItem("credentialsFolderPath") || "./data",
-  );
-  const [enabledCredentials, setEnabledCredentials] = useState<Set<string>>(
-    () => {
-      const saved = localStorage.getItem("enabledCredentials");
-      if (saved) {
-        try {
-          return new Set(JSON.parse(saved) as string[]);
-        } catch {
-          return new Set<string>();
-        }
-      }
-      return new Set<string>();
-    },
   );
   const [rawCredentials, setRawCredentials] = useState<RawCredentials | null>(
     null,
@@ -1680,14 +1666,6 @@ const App = () => {
                   <TabsTrigger value="credentials">
                     <Shield className="w-4 h-4 mr-2" />
                     Credentials
-                    {enabledCredentials.size > 0 && (
-                      <Badge
-                        variant="secondary"
-                        className="ml-1.5 text-xs px-1.5 py-0"
-                      >
-                        {enabledCredentials.size}
-                      </Badge>
-                    )}
                   </TabsTrigger>
                   <TabsTrigger
                     value="resources"
@@ -1877,7 +1855,6 @@ const App = () => {
                         loadedServers={currentServers}
                         config={config}
                         credentialsFolderPath={credentialsFolderPath}
-                        enabledCredentials={enabledCredentials}
                         rawCredentials={rawCredentials}
                       />
                       <ConsoleTab />
@@ -1911,8 +1888,6 @@ const App = () => {
                           config={config}
                           credentialsFolderPath={credentialsFolderPath}
                           setCredentialsFolderPath={setCredentialsFolderPath}
-                          enabledCredentials={enabledCredentials}
-                          setEnabledCredentials={setEnabledCredentials}
                           rawCredentials={rawCredentials}
                           setRawCredentials={setRawCredentials}
                           onTestConnection={handleTestConnection}
@@ -1965,14 +1940,6 @@ const App = () => {
                   <TabsTrigger value="credentials">
                     <Shield className="w-4 h-4 mr-2" />
                     Credentials
-                    {enabledCredentials.size > 0 && (
-                      <Badge
-                        variant="secondary"
-                        className="ml-1.5 text-xs px-1.5 py-0"
-                      >
-                        {enabledCredentials.size}
-                      </Badge>
-                    )}
                   </TabsTrigger>
                   <TabsTrigger value="logger">
                     <FileText className="w-4 h-4 mr-2" />
@@ -1984,8 +1951,6 @@ const App = () => {
                     config={config}
                     credentialsFolderPath={credentialsFolderPath}
                     setCredentialsFolderPath={setCredentialsFolderPath}
-                    enabledCredentials={enabledCredentials}
-                    setEnabledCredentials={setEnabledCredentials}
                     rawCredentials={rawCredentials}
                     setRawCredentials={setRawCredentials}
                     onTestConnection={handleTestConnection}

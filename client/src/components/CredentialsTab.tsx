@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -111,8 +110,6 @@ interface CredentialsTabProps {
   config: InspectorConfig;
   credentialsFolderPath: string;
   setCredentialsFolderPath: (path: string) => void;
-  enabledCredentials: Set<string>;
-  setEnabledCredentials: (keys: Set<string>) => void;
   rawCredentials: RawCredentials | null;
   setRawCredentials: (creds: RawCredentials | null) => void;
   onTestConnection?: (
@@ -158,34 +155,6 @@ const getCredentialRecord = (
 ) =>
   rawCredentials?.[getCredentialIdentity(entry)] || rawCredentials?.[entry.key];
 
-const areStringSetsEqual = (left: Set<string>, right: Set<string>) =>
-  left.size === right.size && [...left].every((value) => right.has(value));
-
-const normalizeEnabledCredentialsForEntries = (
-  enabledCredentials: Set<string>,
-  entries: CredentialEntry[],
-) => {
-  const normalized = new Set<string>();
-
-  for (const enabledKey of enabledCredentials) {
-    const matchingEntries = entries.filter(
-      (entry) =>
-        enabledKey === getCredentialIdentity(entry) || enabledKey === entry.key,
-    );
-
-    if (matchingEntries.length === 0) {
-      normalized.add(enabledKey);
-      continue;
-    }
-
-    for (const entry of matchingEntries) {
-      normalized.add(getCredentialIdentity(entry));
-    }
-  }
-
-  return normalized;
-};
-
 const buildCredentialFilePath = (folderPath: string, fileName: string) => {
   const trimmedFolder = folderPath.trim();
   if (!trimmedFolder) return fileName;
@@ -200,8 +169,6 @@ const CredentialsTab = ({
   config,
   credentialsFolderPath,
   setCredentialsFolderPath,
-  enabledCredentials,
-  setEnabledCredentials,
   rawCredentials,
   setRawCredentials,
   onTestConnection,
@@ -245,7 +212,6 @@ const CredentialsTab = ({
   console.log("[CredentialsTab] Render", {
     credentialsFolderPath,
     entriesCount: entries.length,
-    enabledCount: enabledCredentials.size,
     hasRawCredentials: !!rawCredentials,
   });
 
@@ -335,37 +301,6 @@ const CredentialsTab = ({
         setEntries(loadedEntries);
         setRawCredentials(data.credentials || null);
         syncProxyToolSelectionCounts(data.proxyToolSelections, loadedEntries);
-
-        // Auto-enable all credentials on first load if none are enabled
-        if (enabledCredentials.size === 0 && loadedEntries.length > 0) {
-          const allKeys = new Set<string>(
-            loadedEntries.map((entry) => getCredentialIdentity(entry)),
-          );
-          console.log("[CredentialsTab] Auto-enabling all credentials:", [
-            ...allKeys,
-          ]);
-          setEnabledCredentials(allKeys);
-          localStorage.setItem(
-            "enabledCredentials",
-            JSON.stringify([...allKeys]),
-          );
-        } else if (loadedEntries.length > 0) {
-          const normalizedEnabled = normalizeEnabledCredentialsForEntries(
-            enabledCredentials,
-            loadedEntries,
-          );
-          if (!areStringSetsEqual(enabledCredentials, normalizedEnabled)) {
-            console.log(
-              "[CredentialsTab] Migrating enabled credential keys to file-aware ids:",
-              [...normalizedEnabled],
-            );
-            setEnabledCredentials(normalizedEnabled);
-            localStorage.setItem(
-              "enabledCredentials",
-              JSON.stringify([...normalizedEnabled]),
-            );
-          }
-        }
       } catch (error) {
         console.error("[CredentialsTab] Error loading credentials:", error);
         toast({
@@ -380,8 +315,6 @@ const CredentialsTab = ({
     [
       config,
       credentialsFolderPath,
-      enabledCredentials,
-      setEnabledCredentials,
       setRawCredentials,
       syncProxyToolSelectionCounts,
       toast,
@@ -544,6 +477,19 @@ const CredentialsTab = ({
         `[CredentialsTab:dragDrop] File dropped: ${file.name}, size=${file.size}, type=${file.type}`,
       );
 
+      if (isLoading) {
+        console.warn(
+          "[CredentialsTab:dragDrop] Rejected drop while credentials are busy",
+        );
+        toast({
+          title: "Credentials are busy",
+          description:
+            "Wait for the current load or upload to finish before dropping another file.",
+          variant: "destructive",
+        });
+        return;
+      }
+
       if (!file.name.endsWith(".json")) {
         console.warn(
           "[CredentialsTab:dragDrop] Rejected non-JSON file:",
@@ -611,18 +557,27 @@ const CredentialsTab = ({
           `[CredentialsTab:dragDrop] Upload success: folder=${data.folderPath}, file=${data.fileName}, count=${data.count}`,
         );
 
+        const uploadedEntries = (data.entries || []) as CredentialEntry[];
+        const uploadedCredentialIds = uploadedEntries.map((entry) =>
+          getCredentialIdentity(entry),
+        );
+        const targetFolderPath = data.folderPath || credentialsFolderPath;
+
         // Update folder path if not set yet
-        if (!credentialsFolderPath && data.folderPath) {
-          setCredentialsFolderPath(data.folderPath);
-          localStorage.setItem("credentialsFolderPath", data.folderPath);
+        if (!credentialsFolderPath && targetFolderPath) {
+          setCredentialsFolderPath(targetFolderPath);
+          localStorage.setItem("credentialsFolderPath", targetFolderPath);
         }
 
         // Reload all credentials from the folder
-        loadCredentials(data.folderPath || credentialsFolderPath);
+        loadCredentials(targetFolderPath);
 
         toast({
           title: "Credentials Loaded",
-          description: `Saved ${file.name} with ${data.count} credential(s) to folder`,
+          description:
+            uploadedCredentialIds.length > 0
+              ? `Saved ${file.name} with ${data.count} credential(s). Credentials are enabled by default.`
+              : `Saved ${file.name}, but no credential entries were found in the file.`,
         });
       } catch (error) {
         console.error("[CredentialsTab:dragDrop] Error:", error);
@@ -638,6 +593,7 @@ const CredentialsTab = ({
     [
       config,
       credentialsFolderPath,
+      isLoading,
       setCredentialsFolderPath,
       loadCredentials,
       toast,
@@ -687,6 +643,16 @@ const CredentialsTab = ({
         `[CredentialsTab:dragDrop] window drop event, files=${files?.length ?? 0}`,
       );
 
+      if (files && files.length > 1) {
+        toast({
+          title: "One file at a time",
+          description:
+            "Drop a single .json credentials file so the import result is clear.",
+          variant: "destructive",
+        });
+        return;
+      }
+
       if (files && files.length > 0) {
         handleFileDrop(files[0]);
       }
@@ -710,67 +676,7 @@ const CredentialsTab = ({
         "[CredentialsTab:dragDrop] Window drag-drop listeners removed",
       );
     };
-  }, [handleFileDrop]);
-
-  // Toggle a credential on/off
-  const handleToggleCredential = useCallback(
-    (entry: CredentialEntry) => {
-      const credentialId = getCredentialIdentity(entry);
-      const newEnabled = normalizeEnabledCredentialsForEntries(
-        enabledCredentials,
-        entries,
-      );
-      if (newEnabled.has(credentialId)) {
-        console.log(`[CredentialsTab] Disabling credential: ${credentialId}`);
-        newEnabled.delete(credentialId);
-      } else {
-        console.log(`[CredentialsTab] Enabling credential: ${credentialId}`);
-        newEnabled.add(credentialId);
-      }
-      setEnabledCredentials(newEnabled);
-      localStorage.setItem(
-        "enabledCredentials",
-        JSON.stringify([...newEnabled]),
-      );
-      const persistEnabledState = async () => {
-        try {
-          const baseUrl = getMCPProxyAddress(config);
-          const { token, header } = getMCPProxyAuthToken(config);
-          const resp = await fetch(`${baseUrl}/credentials/enabled`, {
-            method: "PUT",
-            headers: {
-              "Content-Type": "application/json",
-              [header]: token ? `Bearer ${token}` : "",
-            },
-            body: JSON.stringify({
-              folderPath: credentialsFolderPath || "./data",
-              enabledCredentialKeys: [...newEnabled],
-            }),
-          });
-          if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            console.warn(
-              "[CredentialsTab] Failed to persist enabled credential state:",
-              err,
-            );
-          }
-        } catch (error) {
-          console.warn(
-            "[CredentialsTab] Error persisting enabled credential state:",
-            error,
-          );
-        }
-      };
-      void persistEnabledState();
-    },
-    [
-      config,
-      credentialsFolderPath,
-      enabledCredentials,
-      entries,
-      setEnabledCredentials,
-    ],
-  );
+  }, [handleFileDrop, toast]);
 
   // Refresh a credential's token
   const handleRefreshToken = useCallback(
@@ -2079,21 +1985,13 @@ const CredentialsTab = ({
                     rawCredentials,
                     entry,
                   );
-                  const isEnabled =
-                    enabledCredentials.has(credentialId) ||
-                    enabledCredentials.has(entry.key);
                   const expiryStatus = getExpiryStatus(entry);
                   const isRefreshing = refreshingKey === credentialId;
                   const enabledToolCount =
                     proxyToolSelectionCounts[credentialId];
 
                   return (
-                    <Card
-                      key={credentialId}
-                      className={`transition-all duration-200 ${
-                        !isEnabled ? "opacity-50 bg-muted/30" : ""
-                      }`}
-                    >
+                    <Card key={credentialId}>
                       <CardHeader className="pb-2">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-3">
@@ -2139,7 +2037,7 @@ const CredentialsTab = ({
                                 variant="ghost"
                                 size="sm"
                                 onClick={() => handleRefreshToken(entry)}
-                                disabled={isRefreshing || !isEnabled}
+                                disabled={isRefreshing}
                                 title="Refresh token"
                               >
                                 {isRefreshing ? (
@@ -2149,13 +2047,6 @@ const CredentialsTab = ({
                                 )}
                               </Button>
                             )}
-                            {/* Enable/disable toggle */}
-                            <Switch
-                              checked={isEnabled}
-                              onCheckedChange={() =>
-                                handleToggleCredential(entry)
-                              }
-                            />
                           </div>
                         </div>
                       </CardHeader>
@@ -2165,7 +2056,7 @@ const CredentialsTab = ({
                             variant="outline"
                             size="sm"
                             className="h-7 px-2 text-xs"
-                            disabled={!isEnabled || !entry.hasAccessToken}
+                            disabled={!entry.hasAccessToken}
                             onClick={() => handleTestConnection(entry)}
                             title="Test connection to server"
                           >
@@ -2400,11 +2291,7 @@ const CredentialsTab = ({
                                     onClick={() =>
                                       handleInstallCredential(entry)
                                     }
-                                    disabled={
-                                      isInstalling ||
-                                      !isEnabled ||
-                                      !entry.serverUrl
-                                    }
+                                    disabled={isInstalling || !entry.serverUrl}
                                     title="Install proxy server to MCP config"
                                   >
                                     {isInstalling ? (
@@ -2423,9 +2310,7 @@ const CredentialsTab = ({
                                     handleAuthenticateCredential(entry)
                                   }
                                   disabled={
-                                    isAuthenticating ||
-                                    !isEnabled ||
-                                    !entry.serverUrl
+                                    isAuthenticating || !entry.serverUrl
                                   }
                                   title="Authenticate with OAuth"
                                 >
@@ -2441,7 +2326,7 @@ const CredentialsTab = ({
                                   size="sm"
                                   className="h-7 px-2 text-xs"
                                   onClick={() => handleOpenProxy(entry)}
-                                  disabled={!isEnabled || !entry.serverUrl}
+                                  disabled={!entry.serverUrl}
                                   title="Open proxy config popup"
                                 >
                                   <Network className="w-3.5 h-3.5 mr-1" />

@@ -72,16 +72,6 @@ const normalizeCredentialUrl = (value: unknown): string | null => {
   }
 };
 
-const readEnabledCredentialKeysFromStorage = (): string[] => {
-  try {
-    const saved = localStorage.getItem("enabledCredentials");
-    return saved ? (JSON.parse(saved) as string[]) : [];
-  } catch (error) {
-    console.warn("[ToolsTab] Failed to read enabledCredentials", error);
-    return [];
-  }
-};
-
 const ToolsTab = ({
   tools,
   listTools,
@@ -98,7 +88,6 @@ const ToolsTab = ({
   loadedServers,
   config,
   credentialsFolderPath,
-  enabledCredentials,
   rawCredentials,
 }: {
   tools: Tool[];
@@ -119,7 +108,6 @@ const ToolsTab = ({
   loadedServers?: Record<string, any>;
   config?: InspectorConfig;
   credentialsFolderPath?: string;
-  enabledCredentials?: Set<string>;
   rawCredentials?: RawCredentials | null;
 }) => {
   const [params, setParams] = useState<Record<string, unknown>>({});
@@ -372,16 +360,11 @@ const ToolsTab = ({
         credentialsFolderPath ||
         localStorage.getItem("credentialsFolderPath") ||
         "./data";
-      const enabledKeys =
-        enabledCredentials && enabledCredentials.size > 0
-          ? [...enabledCredentials]
-          : readEnabledCredentialKeysFromStorage();
 
       if (serverUrl && effectiveCredentialsFolderPath) {
         requestBody.credentialsFolderPath = effectiveCredentialsFolderPath;
-        requestBody.enabledCredentialKeys = enabledKeys;
 
-        const matchingKey = enabledKeys.find(
+        const matchingKey = Object.keys(rawCredentials || {}).find(
           (key) =>
             normalizeCredentialUrl(rawCredentials?.[key]?.server_url) ===
             serverUrl,
@@ -402,7 +385,6 @@ const ToolsTab = ({
         bodyKeys: Object.keys(requestBody),
         serverUrl,
         credentialsFolderPath: requestBody.credentialsFolderPath,
-        enabledCredentialKeys: requestBody.enabledCredentialKeys,
         credentialMeta: requestBody.credentialMeta,
       });
 
@@ -411,12 +393,7 @@ const ToolsTab = ({
   -H "Content-Type: application/json" \\
   -d '${JSON.stringify(requestBody, null, 2)}'`;
     },
-    [
-      currentServerConfig,
-      credentialsFolderPath,
-      enabledCredentials,
-      rawCredentials,
-    ],
+    [currentServerConfig, credentialsFolderPath, rawCredentials],
   );
 
   const generateCurlCommand = () => {
