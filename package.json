@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.17.28",
+  "version": "0.17.31",
   "description": "Model Context Protocol inspector",
   "license": "MIT",
   "author": "Anthropic, PBC (https://anthropic.com)",
@@ -47,7 +47,7 @@
     "prepare": "husky",
     "prepack": "npm run build",
     "publish-all": "npm publish --workspaces --access public && npm publish --access public",
-    "release": "npm run bump-version && npm publish --access public",
+    "release": "npm run bump-version && npm login && npm publish --access public",
     "bump-version": "node .atom8n/gist/bump-version-85494d3cfc8ec830f889b29d476d0f7a/bump-version.mjs",
     "update-version": "node scripts/update-version.js",
     "check-version": "node scripts/check-version-consistency.js"
