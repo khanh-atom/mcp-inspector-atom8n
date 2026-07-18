@@ -131,6 +131,7 @@ export default function mcpProxy({
 
   // Track tools/list request IDs so we can filter the responses
   const pendingToolsListIds = new Set<string | number>();
+  let pendingInitializeRequestId: string | number | undefined;
   const isFiltering = allowedTools != null && allowedTools.size > 0;
 
   if (isFiltering) {
@@ -143,6 +144,10 @@ export default function mcpProxy({
 
   const forwardToServer = async (message: JSONRPCMessage) => {
     console.log(`[mcpProxy] Client → Server: ${summarizeMessage(message)}`);
+
+    if (isJSONRPCRequest(message) && message.method === "initialize") {
+      pendingInitializeRequestId = message.id;
+    }
 
     // If filtering is active, check tools/call requests
     if (isFiltering && isJSONRPCRequest(message)) {
@@ -206,6 +211,23 @@ export default function mcpProxy({
   };
 
   transportToServer.onmessage = (message) => {
+    if (
+      pendingInitializeRequestId !== undefined &&
+      "id" in message &&
+      message.id === pendingInitializeRequestId
+    ) {
+      if ("result" in message) {
+        const result = message.result as Record<string, unknown>;
+        if (typeof result?.protocolVersion === "string") {
+          transportToServer.setProtocolVersion?.(result.protocolVersion);
+          console.log(
+            `[mcpProxy] Upstream negotiated protocol version: ${result.protocolVersion}`,
+          );
+        }
+      }
+      pendingInitializeRequestId = undefined;
+    }
+
     if (!reportedServerSession) {
       if (transportToServer.sessionId) {
         // Can only report for StreamableHttp

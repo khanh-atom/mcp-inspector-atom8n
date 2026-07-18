@@ -25,6 +25,10 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  LATEST_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+} from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   discoverAuthorizationServerMetadata,
@@ -149,6 +153,32 @@ const sendErrorResponse = (
   }
 
   res.status(fallbackStatus).json(error);
+};
+
+const bridgeInboundMcpProtocolVersion = (req: express.Request): void => {
+  const rawProtocolVersion = req.headers["mcp-protocol-version"];
+  const protocolVersion = Array.isArray(rawProtocolVersion)
+    ? rawProtocolVersion.at(-1)
+    : rawProtocolVersion;
+
+  if (
+    !protocolVersion ||
+    SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)
+  ) {
+    return;
+  }
+
+  // The proxy forwards JSON-RPC messages without interpreting version-specific
+  // features, so each HTTP leg can negotiate its own protocol version.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(protocolVersion)) {
+    req.headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION;
+    logger.info("[mcp:protocol] Bridging client protocol version", {
+      clientProtocolVersion: protocolVersion,
+      proxyProtocolVersion: LATEST_PROTOCOL_VERSION,
+      method: req.method,
+      hasSession: Boolean(req.headers["mcp-session-id"]),
+    });
+  }
 };
 
 // Function to get HTTP headers.
@@ -762,6 +792,7 @@ app.get(
   originValidationMiddleware,
   authMiddleware,
   async (req, res) => {
+    bridgeInboundMcpProtocolVersion(req);
     const sessionId = req.headers["mcp-session-id"] as string;
     logger.info(`Received GET message for sessionId ${sessionId}`);
 
@@ -796,6 +827,7 @@ app.post(
   originValidationMiddleware,
   authMiddleware,
   async (req, res) => {
+    bridgeInboundMcpProtocolVersion(req);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
     if (sessionId) {
@@ -944,6 +976,7 @@ app.delete(
   originValidationMiddleware,
   authMiddleware,
   async (req, res) => {
+    bridgeInboundMcpProtocolVersion(req);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     console.log(`Received DELETE message for sessionId ${sessionId}`);
     if (sessionId) {
