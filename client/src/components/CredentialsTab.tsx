@@ -43,6 +43,7 @@ import {
   Search,
   CheckSquare,
   Square,
+  Plus,
 } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "../lib/hooks/useToast";
@@ -53,6 +54,7 @@ import { getMCPProxyAddress, getMCPProxyAuthToken } from "@/utils/configUtils";
 interface CredentialEntry {
   id?: string;
   key: string;
+  type?: string;
   serverName: string;
   serverUrl: string;
   hasAccessToken: boolean;
@@ -68,13 +70,15 @@ interface CredentialEntry {
 /** Raw credential data from the file */
 interface RawCredentials {
   [key: string]: {
-    server_name: string;
-    server_url: string;
-    client_id: string;
-    access_token: string;
-    expires_at: number;
-    refresh_token: string;
-    scopes: string[];
+    type?: string;
+    url?: string;
+    server_name?: string;
+    server_url?: string;
+    client_id?: string;
+    access_token?: string;
+    expires_at?: number;
+    refresh_token?: string;
+    scopes?: string[];
     _sourceFile?: string;
     _credentialKey?: string;
   };
@@ -116,9 +120,9 @@ interface CredentialsTabProps {
     serverConfig: CredentialTestServerConfig,
   ) => void | Promise<void>;
   /** [PROXY] Current MCP servers from config file */
-  currentServers?: Record<string, any>;
+  currentServers?: Record<string, unknown>;
   /** [PROXY] Callback to update servers state */
-  onServersChange?: (servers: Record<string, any>) => void;
+  onServersChange?: (servers: Record<string, unknown>) => void;
   /** [PROXY] Path to the active MCP config file */
   configFilePath?: string;
   /** [PROXY] Callback when config file is updated */
@@ -141,6 +145,7 @@ function formatDuration(ms: number): string {
 }
 
 const CREDENTIAL_ID_PREFIX = "credential:";
+const DEFAULT_CREATE_CREDENTIAL_TYPE = "http";
 
 const createCredentialIdentity = (sourceFile: string, credentialKey: string) =>
   `${CREDENTIAL_ID_PREFIX}${encodeURIComponent(sourceFile)}:${encodeURIComponent(credentialKey)}`;
@@ -188,6 +193,12 @@ const CredentialsTab = ({
   const [isDragOver, setIsDragOver] = useState(false);
   const [isEditingFolderPath, setIsEditingFolderPath] = useState(false);
   const [folderPathDraft, setFolderPathDraft] = useState("");
+  const [isCreateCredentialOpen, setIsCreateCredentialOpen] = useState(false);
+  const [createCredentialType, setCreateCredentialType] = useState(
+    DEFAULT_CREATE_CREDENTIAL_TYPE,
+  );
+  const [createCredentialUrl, setCreateCredentialUrl] = useState("");
+  const [isCreatingCredential, setIsCreatingCredential] = useState(false);
   const dragCounterRef = useRef(0);
   const { toast } = useToast();
 
@@ -469,6 +480,107 @@ const CredentialsTab = ({
       });
     }
   }, [config, credentialsFolderPath, toast]);
+
+  const resetCreateCredentialForm = useCallback(() => {
+    setCreateCredentialType(DEFAULT_CREATE_CREDENTIAL_TYPE);
+    setCreateCredentialUrl("");
+  }, []);
+
+  const handleCreateCredentialDialogOpenChange = useCallback(
+    (open: boolean) => {
+      setIsCreateCredentialOpen(open);
+      if (!open && !isCreatingCredential) {
+        resetCreateCredentialForm();
+      }
+    },
+    [isCreatingCredential, resetCreateCredentialForm],
+  );
+
+  const handleCreateCredential = useCallback(async () => {
+    const targetCredentialsFolderPath = credentialsFolderPath || "./data";
+    const credentialType =
+      createCredentialType.trim() || DEFAULT_CREATE_CREDENTIAL_TYPE;
+    const credentialUrl = createCredentialUrl.trim();
+
+    if (!credentialUrl) {
+      toast({
+        title: "URL Required",
+        description: "Enter the MCP server URL.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+      const parsedUrl = new URL(credentialUrl);
+      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+        throw new Error("URL must use http or https");
+      }
+    } catch (error) {
+      toast({
+        title: "Invalid URL",
+        description:
+          error instanceof Error ? error.message : "Enter a valid URL.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsCreatingCredential(true);
+    try {
+      const baseUrl = getMCPProxyAddress(config);
+      const { token, header } = getMCPProxyAuthToken(config);
+      const resp = await fetch(`${baseUrl}/credentials/create`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [header]: token ? `Bearer ${token}` : "",
+        },
+        body: JSON.stringify({
+          folderPath: targetCredentialsFolderPath,
+          type: credentialType,
+          url: credentialUrl,
+        }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.message || `Failed to create (${resp.status})`);
+      }
+
+      const data = await resp.json();
+      toast({
+        title: "Credential Created",
+        description: `Saved ${data.credentialKey || "credential"} to ${data.sourceFile || "credentials.json"}`,
+      });
+      setIsCreateCredentialOpen(false);
+      resetCreateCredentialForm();
+      const loadedFolderPath = data.folderPath || targetCredentialsFolderPath;
+      if (!credentialsFolderPath) {
+        setCredentialsFolderPath(loadedFolderPath);
+        localStorage.setItem("credentialsFolderPath", loadedFolderPath);
+      }
+      loadCredentials(loadedFolderPath);
+    } catch (error) {
+      console.error("[CredentialsTab] Error creating credential:", error);
+      toast({
+        title: "Create Failed",
+        description: error instanceof Error ? error.message : String(error),
+        variant: "destructive",
+      });
+    } finally {
+      setIsCreatingCredential(false);
+    }
+  }, [
+    config,
+    createCredentialType,
+    createCredentialUrl,
+    credentialsFolderPath,
+    loadCredentials,
+    resetCreateCredentialForm,
+    setCredentialsFolderPath,
+    toast,
+  ]);
 
   // [DRAG-DROP] Handle file drop — read content and upload to server into the selected folder
   const handleFileDrop = useCallback(
@@ -931,7 +1043,7 @@ const CredentialsTab = ({
             serverName: entry.serverName,
             serverUrl: entry.serverUrl,
             clientId: entry.clientId || undefined,
-            scopes: entry.scopes,
+            scopes: entry.scopes.length > 0 ? entry.scopes : undefined,
           }),
         });
 
@@ -1254,7 +1366,6 @@ const CredentialsTab = ({
     [
       config,
       configFilePath,
-      credentialsFolderPath,
       currentServers,
       getProxyServerKey,
       onConfigFileUpdated,
@@ -1632,15 +1743,7 @@ const CredentialsTab = ({
       title: "Copied",
       description: "MCP server config copied to clipboard",
     });
-  }, [
-    proxyEntry,
-    getProxyServerKey,
-    config,
-    configFilePath,
-    proxySelectedTools,
-    proxyTools,
-    toast,
-  ]);
+  }, [proxyEntry, getProxyServerKey, config, configFilePath, toast]);
 
   // [PROXY] Copy curl command to clipboard
   const handleCopyCurl = useCallback(() => {
@@ -1783,6 +1886,16 @@ const CredentialsTab = ({
             )}
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              variant="default"
+              size="sm"
+              onClick={() => setIsCreateCredentialOpen(true)}
+              disabled={isLoading}
+              title="Create credential"
+            >
+              <Plus className="w-4 h-4 mr-2" />
+              Create
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -1989,6 +2102,8 @@ const CredentialsTab = ({
                   const isRefreshing = refreshingKey === credentialId;
                   const enabledToolCount =
                     proxyToolSelectionCounts[credentialId];
+                  const accessToken = credentialRecord?.access_token;
+                  const refreshToken = credentialRecord?.refresh_token;
 
                   return (
                     <Card key={credentialId}>
@@ -2016,6 +2131,14 @@ const CredentialsTab = ({
                               </CardTitle>
                               <CardDescription className="flex items-center gap-1.5 mt-0.5">
                                 <Globe className="w-3 h-3" />
+                                {entry.type && (
+                                  <Badge
+                                    variant="outline"
+                                    className="h-4 px-1 text-[10px] uppercase"
+                                  >
+                                    {entry.type}
+                                  </Badge>
+                                )}
                                 <span className="truncate max-w-[300px]">
                                   {entry.serverUrl}
                                 </span>
@@ -2109,32 +2232,31 @@ const CredentialsTab = ({
                                     <p className="text-xs font-medium text-muted-foreground">
                                       Access Token
                                     </p>
-                                    {entry.hasAccessToken &&
-                                      credentialRecord?.access_token && (
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-6 px-2 text-xs"
-                                          onClick={() => {
-                                            navigator.clipboard.writeText(
-                                              credentialRecord.access_token,
-                                            );
-                                            toast({
-                                              title: "Copied",
-                                              description:
-                                                "Access token copied to clipboard",
-                                            });
-                                          }}
-                                        >
-                                          <Copy className="w-3 h-3 mr-1" />
-                                          Copy
-                                        </Button>
-                                      )}
+                                    {entry.hasAccessToken && accessToken && (
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-6 px-2 text-xs"
+                                        onClick={() => {
+                                          navigator.clipboard.writeText(
+                                            accessToken,
+                                          );
+                                          toast({
+                                            title: "Copied",
+                                            description:
+                                              "Access token copied to clipboard",
+                                          });
+                                        }}
+                                      >
+                                        <Copy className="w-3 h-3 mr-1" />
+                                        Copy
+                                      </Button>
+                                    )}
                                   </div>
                                   {entry.hasAccessToken ? (
                                     <p className="text-sm font-mono bg-muted px-3 py-1.5 rounded break-all max-h-20 overflow-auto">
-                                      {credentialRecord?.access_token
-                                        ? `${credentialRecord.access_token.substring(0, 50)}...`
+                                      {accessToken
+                                        ? `${accessToken.substring(0, 50)}...`
                                         : "Available"}
                                     </p>
                                   ) : (
@@ -2151,14 +2273,14 @@ const CredentialsTab = ({
                                       <p className="text-xs font-medium text-muted-foreground">
                                         Refresh Token
                                       </p>
-                                      {credentialRecord?.refresh_token && (
+                                      {refreshToken && (
                                         <Button
                                           variant="ghost"
                                           size="sm"
                                           className="h-6 px-2 text-xs"
                                           onClick={() => {
                                             navigator.clipboard.writeText(
-                                              credentialRecord.refresh_token,
+                                              refreshToken,
                                             );
                                             toast({
                                               title: "Copied",
@@ -2173,8 +2295,8 @@ const CredentialsTab = ({
                                       )}
                                     </div>
                                     <p className="text-sm font-mono bg-muted px-3 py-1.5 rounded break-all max-h-20 overflow-auto">
-                                      {credentialRecord?.refresh_token
-                                        ? `${credentialRecord.refresh_token.substring(0, 50)}...`
+                                      {refreshToken
+                                        ? `${refreshToken.substring(0, 50)}...`
                                         : "Available"}
                                     </p>
                                   </div>
@@ -2364,6 +2486,88 @@ const CredentialsTab = ({
             </CardContent>
           </Card>
         )}
+
+        <Dialog
+          open={isCreateCredentialOpen}
+          onOpenChange={handleCreateCredentialDialogOpenChange}
+        >
+          <DialogContent className="max-w-md">
+            <form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleCreateCredential();
+              }}
+            >
+              <DialogHeader>
+                <DialogTitle>Create Credential</DialogTitle>
+                <DialogDescription>
+                  Add an MCP server URL to the active credentials folder.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label
+                    htmlFor="create-credential-type"
+                    className="text-sm font-medium"
+                  >
+                    Type
+                  </label>
+                  <Input
+                    id="create-credential-type"
+                    value={createCredentialType}
+                    onChange={(event) =>
+                      setCreateCredentialType(event.target.value)
+                    }
+                    placeholder={DEFAULT_CREATE_CREDENTIAL_TYPE}
+                    disabled={isCreatingCredential}
+                    autoFocus
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label
+                    htmlFor="create-credential-url"
+                    className="text-sm font-medium"
+                  >
+                    URL
+                  </label>
+                  <Input
+                    id="create-credential-url"
+                    type="url"
+                    value={createCredentialUrl}
+                    onChange={(event) =>
+                      setCreateCredentialUrl(event.target.value)
+                    }
+                    placeholder="https://mcp.supabase.com/mcp"
+                    disabled={isCreatingCredential}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  credentials.json in {credentialsFolderPath || "./data"}
+                </p>
+              </div>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => handleCreateCredentialDialogOpenChange(false)}
+                  disabled={isCreatingCredential}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={isCreatingCredential || !createCredentialUrl.trim()}
+                >
+                  {isCreatingCredential && (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  )}
+                  Create
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
 
         <Dialog
           open={!!editingEntry}

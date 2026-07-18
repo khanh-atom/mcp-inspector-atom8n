@@ -8,6 +8,10 @@ import nodeFetch, { Headers as NodeHeaders } from "node-fetch";
 // Type-compatible wrappers for node-fetch to work with browser-style types
 const fetch = nodeFetch;
 const Headers = NodeHeaders;
+const oauthFetch: typeof globalThis.fetch =
+  typeof globalThis.fetch === "function"
+    ? globalThis.fetch.bind(globalThis)
+    : (nodeFetch as unknown as typeof globalThis.fetch);
 
 import {
   SSEClientTransport,
@@ -542,7 +546,7 @@ const createTransport = async (
   let credentialMetaForRefresh: CredentialMeta | undefined;
 
   // [PROXY] When credentialFile+credentialKey are provided but url is not,
-  // derive the upstream URL from the credential's server_url and default to streamable-http.
+  // derive the upstream URL from the credential's URL and default to streamable-http.
   if (
     !upstreamUrl &&
     credentialFile &&
@@ -561,7 +565,7 @@ const createTransport = async (
     );
     try {
       const located = await readCredentialByMeta(meta);
-      upstreamUrl = located.credential.server_url?.trim();
+      upstreamUrl = getCredentialServerUrl(located.credential);
       if (upstreamUrl) {
         transportType = transportType || "streamable-http";
         console.log(
@@ -569,7 +573,7 @@ const createTransport = async (
         );
       } else {
         throw new Error(
-          `Credential '${credentialKey}' in ${credentialFile} has no server_url`,
+          `Credential '${credentialKey}' in ${credentialFile} has no server URL`,
         );
       }
     } catch (error) {
@@ -2066,6 +2070,8 @@ interface CredentialMeta {
 }
 
 interface CredentialRecord {
+  type?: string;
+  url?: string;
   server_name?: string;
   server_url?: string;
   client_id?: string;
@@ -2378,7 +2384,12 @@ async function writeCredentialOAuthTokens({
     server_url:
       typeof serverUrl === "string" && serverUrl.trim()
         ? serverUrl.trim()
-        : existingCredential.server_url || "",
+        : existingCredential.server_url || existingCredential.url || "",
+    url:
+      typeof serverUrl === "string" && serverUrl.trim()
+        ? serverUrl.trim()
+        : existingCredential.url || existingCredential.server_url || "",
+    type: existingCredential.type || "http",
     client_id:
       typeof clientId === "string" && clientId.trim()
         ? clientId.trim()
@@ -2482,6 +2493,67 @@ function normalizeServerUrl(value: unknown): string | null {
   }
 }
 
+function getCredentialServerUrl(credential: CredentialRecord): string {
+  const serverUrl =
+    typeof credential.server_url === "string" && credential.server_url.trim()
+      ? credential.server_url
+      : typeof credential.url === "string"
+        ? credential.url
+        : "";
+  return serverUrl.trim();
+}
+
+function sanitizeCredentialServerName(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function deriveCredentialServerName(serverUrl: string): string {
+  try {
+    const hostname = new URL(serverUrl).hostname.toLowerCase();
+    const withoutMcpPrefix = hostname.replace(/^mcp\./, "");
+    const [firstLabel] = withoutMcpPrefix.split(".");
+    return sanitizeCredentialServerName(firstLabel || "mcp") || "mcp";
+  } catch {
+    return "mcp";
+  }
+}
+
+function normalizeCredentialSourceFileName(fileName: unknown): string {
+  const targetFile =
+    typeof fileName === "string" && fileName.trim()
+      ? fileName.trim()
+      : "credentials.json";
+
+  if (
+    !targetFile.endsWith(".json") ||
+    targetFile.startsWith(".") ||
+    targetFile.includes("/") ||
+    targetFile.includes("\\") ||
+    targetFile === CREDENTIALS_STATE_FILE
+  ) {
+    throw new Error(`Invalid credential source file: ${targetFile}`);
+  }
+
+  return targetFile;
+}
+
+function createUniqueCredentialKey(
+  serverName: string,
+  credentials: Record<string, CredentialRecord>,
+): string {
+  const safeServerName = sanitizeCredentialServerName(serverName) || "mcp";
+  let credentialKey = `${safeServerName}|${randomBytes(8).toString("hex")}`;
+  while (credentials[credentialKey]) {
+    credentialKey = `${safeServerName}|${randomBytes(8).toString("hex")}`;
+  }
+  return credentialKey;
+}
+
 function redactUrlForLog(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) return "";
 
@@ -2494,6 +2566,148 @@ function redactUrlForLog(value: unknown): string {
   } catch {
     return `[unparseable URL, length=${value.length}]`;
   }
+}
+
+type OAuthAuthorizationMetadata = Awaited<
+  ReturnType<typeof discoverAuthorizationServerMetadata>
+>;
+type OAuthProtectedResourceMetadata = Awaited<
+  ReturnType<typeof discoverOAuthProtectedResourceMetadata>
+>;
+
+function summarizeOAuthProtectedResourceMetadata(
+  metadata: OAuthProtectedResourceMetadata | undefined,
+): Record<string, unknown> {
+  if (!metadata) {
+    return { discovered: false };
+  }
+
+  return {
+    discovered: true,
+    resource: redactUrlForLog(metadata.resource),
+    resourceName: metadata.resource_name,
+    authorizationServers: metadata.authorization_servers?.map((url) =>
+      redactUrlForLog(url),
+    ),
+    bearerMethodsSupported: metadata.bearer_methods_supported,
+    scopesSupportedCount: metadata.scopes_supported?.length ?? 0,
+    scopesSupported: metadata.scopes_supported,
+  };
+}
+
+function summarizeOAuthAuthorizationMetadata(
+  metadata: OAuthAuthorizationMetadata,
+): Record<string, unknown> {
+  if (!metadata) {
+    return { discovered: false };
+  }
+
+  return {
+    discovered: true,
+    issuer: redactUrlForLog(metadata.issuer),
+    authorizationEndpoint: redactUrlForLog(metadata.authorization_endpoint),
+    tokenEndpoint: redactUrlForLog(metadata.token_endpoint),
+    registrationEndpoint: redactUrlForLog(metadata.registration_endpoint),
+    responseTypesSupported: metadata.response_types_supported,
+    grantTypesSupported: metadata.grant_types_supported,
+    tokenEndpointAuthMethodsSupported:
+      metadata.token_endpoint_auth_methods_supported,
+    codeChallengeMethodsSupported: metadata.code_challenge_methods_supported,
+    scopesSupportedCount: metadata.scopes_supported?.length ?? 0,
+    scopesSupported: metadata.scopes_supported,
+  };
+}
+
+function summarizeOAuthClientInformation(
+  clientInformation: OAuthClientInformation | null,
+): Record<string, unknown> {
+  if (!clientInformation) {
+    return { available: false };
+  }
+
+  return {
+    available: true,
+    clientIdLength: clientInformation.client_id.length,
+    hasClientSecret: Boolean(clientInformation.client_secret),
+    clientIdIssuedAt: clientInformation.client_id_issued_at,
+    clientSecretExpiresAt: clientInformation.client_secret_expires_at,
+  };
+}
+
+function normalizeOAuthScopes(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      value
+        .filter((scope): scope is string => typeof scope === "string")
+        .map((scope) => scope.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function summarizeOAuthError(error: unknown): Record<string, unknown> {
+  if (!error || typeof error !== "object") {
+    return { value: String(error) };
+  }
+
+  const errorRecord = error as Record<string, unknown>;
+  const summary: Record<string, unknown> = {};
+  const knownKeys = new Set(["name", "message", "stack", "cause"]);
+
+  if (typeof errorRecord.name === "string") {
+    summary.name = errorRecord.name;
+  }
+  if (typeof errorRecord.message === "string") {
+    summary.message = errorRecord.message;
+  }
+  if (typeof errorRecord.stack === "string") {
+    summary.stack = errorRecord.stack;
+  }
+
+  for (const key of [
+    "error",
+    "error_description",
+    "error_uri",
+    "errorCode",
+    "errorUri",
+    "status",
+    "statusCode",
+  ]) {
+    const value = errorRecord[key];
+    if (value !== undefined) {
+      summary[key] = value;
+      knownKeys.add(key);
+    }
+  }
+
+  const extra = Object.fromEntries(
+    Object.entries(errorRecord).filter(([key]) => !knownKeys.has(key)),
+  );
+  if (Object.keys(extra).length > 0) {
+    summary.extra = extra;
+  }
+
+  if (errorRecord.cause !== undefined && errorRecord.cause !== error) {
+    summary.cause = summarizeOAuthError(errorRecord.cause);
+  }
+
+  return summary;
+}
+
+function getOAuthErrorMessage(error: unknown): string {
+  if (
+    error &&
+    typeof error === "object" &&
+    typeof (error as Record<string, unknown>).message === "string"
+  ) {
+    return (error as Record<string, string>).message;
+  }
+
+  return String(error);
 }
 
 const CREDENTIAL_ID_PREFIX = "credential:";
@@ -2578,7 +2792,9 @@ async function findCredentialForServerUrl(
       }
 
       for (const [credentialKey, credential] of Object.entries(credentials)) {
-        const credentialServerUrl = normalizeServerUrl(credential.server_url);
+        const credentialServerUrl = normalizeServerUrl(
+          getCredentialServerUrl(credential),
+        );
         if (credentialServerUrl !== normalizedServerUrl) {
           logger.info(
             `[credentials:lookup] Skipping key '${credentialKey}' from ${sourceFile}: server URL mismatch credential=${credentialServerUrl} request=${normalizedServerUrl}`,
@@ -2630,14 +2846,15 @@ async function refreshCredentialToken(
     );
   }
 
-  if (!cred.refresh_token || !cred.client_id || !cred.server_url) {
+  const credentialServerUrl = getCredentialServerUrl(cred);
+  if (!cred.refresh_token || !cred.client_id || !credentialServerUrl) {
     throw new Error(
-      `Credential '${meta.credentialKey}' missing refresh_token, client_id, or server_url`,
+      `Credential '${meta.credentialKey}' missing refresh_token, client_id, or server URL`,
     );
   }
 
   // Derive token endpoint from server URL
-  const serverUrl = new URL(cred.server_url);
+  const serverUrl = new URL(credentialServerUrl);
   const apiHost = serverUrl.hostname.replace(/^mcp\./, "api.");
   const tokenUrl = `https://${apiHost}/oauth2/v1/token`;
 
@@ -3862,6 +4079,7 @@ function parseCredentialFile(
 ): Array<{
   id: string;
   key: string;
+  type: string;
   serverName: string;
   serverUrl: string;
   hasAccessToken: boolean;
@@ -3877,8 +4095,9 @@ function parseCredentialFile(
   return Object.entries(parsed).map(([key, value]: [string, any]) => ({
     id: createCredentialIdentity(fileName, key),
     key,
+    type: typeof value.type === "string" ? value.type : "",
     serverName: value.server_name || key.split("|")[0] || "unknown",
-    serverUrl: value.server_url || "",
+    serverUrl: value.server_url || value.url || "",
     hasAccessToken: !!value.access_token,
     hasRefreshToken: !!value.refresh_token,
     expiresAt: value.expires_at || null,
@@ -4066,6 +4285,144 @@ app.put(
       res.status(500).json({
         error: "Internal Server Error",
         message: error?.message || String(error),
+      });
+    }
+  },
+);
+
+// POST /credentials/create — Add a single URL-based credential to the folder.
+app.post(
+  "/credentials/create",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const {
+        folderPath: rawFolder,
+        fileName,
+        type,
+        url,
+        serverName,
+      } = req.body;
+      const folderPath =
+        typeof rawFolder === "string" && rawFolder.trim()
+          ? rawFolder.trim()
+          : getEffectiveCredentialsFolderPath();
+      const credentialType =
+        typeof type === "string" && type.trim() ? type.trim() : "http";
+      const rawServerUrl = typeof url === "string" ? url.trim() : "";
+
+      if (!rawServerUrl) {
+        logger.warn("[credentials:create] Missing 'url'");
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'url' is required",
+        });
+        return;
+      }
+
+      let parsedServerUrl: URL;
+      try {
+        parsedServerUrl = new URL(rawServerUrl);
+      } catch {
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'url' must be a valid URL",
+        });
+        return;
+      }
+
+      if (!["http:", "https:"].includes(parsedServerUrl.protocol)) {
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'url' must use http or https",
+        });
+        return;
+      }
+
+      const targetFile = normalizeCredentialSourceFileName(fileName);
+      const folder = path.resolve(expandTildePath(folderPath));
+      await fs.mkdir(folder, { recursive: true });
+
+      const metaBase: CredentialMeta = {
+        folderPath,
+        sourceFile: targetFile,
+        credentialKey: "",
+      };
+      const filePath = credentialFilePath(metaBase);
+      let credentials: Record<string, CredentialRecord> = {};
+
+      try {
+        const fileContent = await fs.readFile(filePath, "utf8");
+        if (fileContent.trim()) {
+          const parsed = JSON.parse(fileContent);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("Credentials file must contain a JSON object");
+          }
+          credentials = parsed as Record<string, CredentialRecord>;
+        }
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") {
+          throw new Error(
+            `Credentials file not found or invalid: ${filePath} — ${error?.message || String(error)}`,
+          );
+        }
+      }
+
+      const credentialServerName =
+        typeof serverName === "string" && serverName.trim()
+          ? serverName.trim()
+          : deriveCredentialServerName(rawServerUrl);
+      const credentialKey = createUniqueCredentialKey(
+        credentialServerName,
+        credentials,
+      );
+
+      credentials[credentialKey] = {
+        type: credentialType,
+        url: rawServerUrl,
+        server_name: credentialServerName,
+        server_url: rawServerUrl,
+        client_id: "",
+        access_token: "",
+        refresh_token: "",
+        scopes: [],
+      };
+
+      await fs.writeFile(
+        filePath,
+        JSON.stringify(credentials, null, 4),
+        "utf8",
+      );
+      setActiveCredentialsFolderPath(folderPath, "POST /credentials/create");
+
+      const entry = parseCredentialFile(
+        JSON.stringify({ [credentialKey]: credentials[credentialKey] }),
+        targetFile,
+      )[0];
+
+      logger.info(
+        `[credentials:create] Created credential '${credentialKey}' in ${filePath}`,
+      );
+      res.json({
+        success: true,
+        folderPath,
+        absoluteFolderPath: folder,
+        sourceFile: targetFile,
+        credentialKey,
+        credential: credentials[credentialKey],
+        entry,
+      });
+    } catch (error: any) {
+      logger.error("[credentials:create] Error:", error);
+      const message = error?.message || String(error);
+      const statusCode = message.includes("Invalid credential source file")
+        ? 400
+        : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? "Bad Request" : "Internal Server Error",
+        message,
       });
     }
   },
@@ -4331,6 +4688,12 @@ app.get(
     if (oauthError) {
       const description =
         getQueryString(req.query.error_description) || oauthError;
+      logger.warn("[credentials:auth] OAuth callback returned an error", {
+        authId: flow.status.id,
+        serverName: flow.credentialServerName,
+        error: oauthError,
+        description,
+      });
       completeCredentialOAuthStatus(
         flow.status,
         { status: "error", error: description },
@@ -4353,6 +4716,16 @@ app.get(
     }
 
     try {
+      logger.info("[credentials:auth] Exchanging OAuth callback code", {
+        authId: flow.status.id,
+        serverName: flow.credentialServerName,
+        authServerUrl: redactUrlForLog(String(flow.authServerUrl)),
+        redirectUri: flow.redirectUri,
+        resource: flow.resource
+          ? redactUrlForLog(flow.resource.toString())
+          : undefined,
+        scopeCount: flow.requestedScopes.length,
+      });
       const tokens = await exchangeAuthorization(flow.authServerUrl, {
         metadata: flow.oauthMetadata ?? undefined,
         clientInformation: flow.clientInformation,
@@ -4360,7 +4733,7 @@ app.get(
         codeVerifier: flow.codeVerifier,
         redirectUri: flow.redirectUri,
         resource: flow.resource,
-        fetchFn: fetch as any,
+        fetchFn: oauthFetch as any,
       });
       const expiresAt = await writeCredentialOAuthTokens({
         meta: flow.meta,
@@ -4376,6 +4749,13 @@ app.get(
         { status: "complete", expiresAt },
         flow.callbackServer,
       );
+      logger.info("[credentials:auth] OAuth callback exchange complete", {
+        authId: flow.status.id,
+        serverName: flow.credentialServerName,
+        expiresAt,
+        hasRefreshToken: Boolean(tokens.refresh_token),
+        tokenScope: typeof tokens.scope === "string" ? tokens.scope : undefined,
+      });
       res
         .status(200)
         .type("html")
@@ -4383,8 +4763,11 @@ app.get(
           "<!doctype html><html><body><h1>Authentication complete</h1><p>You may close this window.</p></body></html>",
         );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.error("[credentials:auth] Callback exchange failed:", error);
+      const message = getOAuthErrorMessage(error);
+      logger.error(
+        "[credentials:auth] Callback exchange failed:",
+        summarizeOAuthError(error),
+      );
       completeCredentialOAuthStatus(
         flow.status,
         { status: "error", error: message },
@@ -4437,11 +4820,10 @@ app.post(
         typeof serverName === "string" && serverName.trim()
           ? serverName.trim()
           : credentialKey.split("|")[0];
-      const requestedScopes = Array.isArray(scopes)
-        ? scopes.filter(
-            (scope: unknown): scope is string => typeof scope === "string",
-          )
-        : [];
+      const explicitRequestedScopes = Array.isArray(scopes)
+        ? normalizeOAuthScopes(scopes)
+        : null;
+      let requestedScopes = explicitRequestedScopes ?? [];
       const isDatadogMcpAuth = isDatadogMcpServerUrl(serverUrl);
       const status: CredentialOAuthStatus = {
         id: authId,
@@ -4451,10 +4833,27 @@ app.post(
         serverName: credentialServerName,
       };
       credentialOAuthStatuses.set(authId, status);
+      logger.info("[credentials:auth] Starting OAuth flow", {
+        authId,
+        credentialKey,
+        sourceFile,
+        serverName: credentialServerName,
+        serverUrl: redactUrlForLog(serverUrl),
+        hasClientId: typeof clientId === "string" && Boolean(clientId.trim()),
+        scopeSource: explicitRequestedScopes ? "credential" : "discovery",
+        requestedScopeCount: requestedScopes.length,
+        requestedScopes,
+        isDatadogMcpAuth,
+      });
       const scheduleAuthTimeout = () => {
         setTimeout(() => {
           const current = credentialOAuthStatuses.get(authId);
           if (current?.status === "pending") {
+            logger.warn("[credentials:auth] OAuth flow timed out", {
+              authId,
+              serverName: credentialServerName,
+              serverUrl: redactUrlForLog(serverUrl),
+            });
             completeCredentialOAuthStatus(
               current,
               {
@@ -4494,31 +4893,61 @@ app.post(
         status.redirectUri = redirectUri;
         let resourceMetadata;
         authServerUrl = serverUrl;
+        logger.info(
+          "[credentials:auth] Discovering protected resource metadata",
+          {
+            authId,
+            serverName: credentialServerName,
+            serverUrl: redactUrlForLog(serverUrl),
+          },
+        );
         try {
           resourceMetadata = await discoverOAuthProtectedResourceMetadata(
             serverUrl,
             undefined,
-            fetch as any,
+            oauthFetch as any,
           );
           if (resourceMetadata?.authorization_servers?.length) {
             authServerUrl = resourceMetadata.authorization_servers[0];
           }
+          logger.info(
+            "[credentials:auth] Protected resource metadata discovered",
+            {
+              authId,
+              metadata:
+                summarizeOAuthProtectedResourceMetadata(resourceMetadata),
+              selectedAuthServerUrl: redactUrlForLog(String(authServerUrl)),
+            },
+          );
         } catch (error) {
           logger.info(
             "[credentials:auth] Protected resource metadata unavailable; falling back to server URL",
-            error,
+            {
+              authId,
+              serverUrl: redactUrlForLog(serverUrl),
+              error: summarizeOAuthError(error),
+            },
           );
         }
 
         resource = resourceMetadata?.resource
           ? new URL(resourceMetadata.resource)
           : new URL(serverUrl);
+        logger.info("[credentials:auth] Discovering authorization metadata", {
+          authId,
+          authServerUrl: redactUrlForLog(String(authServerUrl)),
+          resource: resource ? redactUrlForLog(resource.toString()) : undefined,
+        });
         oauthMetadata = await discoverAuthorizationServerMetadata(
           authServerUrl,
           {
-            fetchFn: fetch as any,
+            fetchFn: oauthFetch as any,
           },
         );
+        logger.info("[credentials:auth] Authorization metadata discovered", {
+          authId,
+          metadata: summarizeOAuthAuthorizationMetadata(oauthMetadata),
+        });
 
         if (!oauthMetadata?.authorization_endpoint) {
           throw new Error(
@@ -4557,7 +4986,12 @@ app.post(
 
         status.authorizationUrl = authorizationUrl.toString();
         logger.info(
-          `[credentials:auth] Starting Datadog MCP OAuth authorization with callback ${redirectUri}`,
+          "[credentials:auth] Starting Datadog MCP OAuth authorization",
+          {
+            authId,
+            redirectUri,
+            authorizationUrl: redactUrlForLog(authorizationUrl.toString()),
+          },
         );
         res.json({
           success: true,
@@ -4597,6 +5031,15 @@ app.post(
             if (oauthError) {
               const description =
                 callbackUrl.searchParams.get("error_description") || oauthError;
+              logger.warn(
+                "[credentials:auth] OAuth callback returned an error",
+                {
+                  authId,
+                  serverName: credentialServerName,
+                  error: oauthError,
+                  description,
+                },
+              );
               callbackRes.writeHead(400, { "Content-Type": "text/plain" });
               callbackRes.end(description);
               completeCredentialOAuthStatus(
@@ -4627,6 +5070,16 @@ app.post(
               throw new Error("OAuth flow is not initialized");
             }
 
+            logger.info("[credentials:auth] Exchanging OAuth callback code", {
+              authId,
+              serverName: credentialServerName,
+              authServerUrl: redactUrlForLog(String(authServerUrl)),
+              redirectUri,
+              resource: resource
+                ? redactUrlForLog(resource.toString())
+                : undefined,
+              scopeCount: requestedScopes.length,
+            });
             const tokens = await exchangeAuthorization(authServerUrl, {
               metadata: oauthMetadata ?? undefined,
               clientInformation,
@@ -4634,7 +5087,7 @@ app.post(
               codeVerifier,
               redirectUri,
               resource,
-              fetchFn: fetch as any,
+              fetchFn: oauthFetch as any,
             });
             const expiresAt = await writeCredentialOAuthTokens({
               meta,
@@ -4654,10 +5107,20 @@ app.post(
               { status: "complete", expiresAt },
               callbackServer,
             );
+            logger.info("[credentials:auth] OAuth callback exchange complete", {
+              authId,
+              serverName: credentialServerName,
+              expiresAt,
+              hasRefreshToken: Boolean(tokens.refresh_token),
+              tokenScope:
+                typeof tokens.scope === "string" ? tokens.scope : undefined,
+            });
           } catch (error) {
-            const message =
-              error instanceof Error ? error.message : String(error);
-            logger.error("[credentials:auth] Callback exchange failed:", error);
+            const message = getOAuthErrorMessage(error);
+            logger.error(
+              "[credentials:auth] Callback exchange failed:",
+              summarizeOAuthError(error),
+            );
             callbackRes.writeHead(500, { "Content-Type": "text/plain" });
             callbackRes.end(message);
             completeCredentialOAuthStatus(
@@ -4677,38 +5140,98 @@ app.post(
         .then((actualPort) => {
           const redirectUri = `http://localhost:${actualPort}${CREDENTIAL_OAUTH_CALLBACK_PATH}`;
           status.redirectUri = redirectUri;
+          logger.info("[credentials:auth] OAuth callback listener ready", {
+            authId,
+            preferredCallbackPort,
+            actualCallbackPort: actualPort,
+            redirectUri,
+          });
           resolveCallbackReady({ server: callbackServer!, redirectUri });
         })
         .catch((error) => {
+          logger.error(
+            "[credentials:auth] OAuth callback listener failed:",
+            summarizeOAuthError(error),
+          );
           rejectCallbackReady(error);
         });
 
       const { redirectUri } = await callbackReady;
-      let resourceMetadata;
+      let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
       authServerUrl = serverUrl;
+      logger.info(
+        "[credentials:auth] Discovering protected resource metadata",
+        {
+          authId,
+          serverName: credentialServerName,
+          serverUrl: redactUrlForLog(serverUrl),
+        },
+      );
       try {
         resourceMetadata = await discoverOAuthProtectedResourceMetadata(
           serverUrl,
           undefined,
-          fetch as any,
+          oauthFetch as any,
         );
         if (resourceMetadata?.authorization_servers?.length) {
           authServerUrl = resourceMetadata.authorization_servers[0];
         }
+        logger.info(
+          "[credentials:auth] Protected resource metadata discovered",
+          {
+            authId,
+            metadata: summarizeOAuthProtectedResourceMetadata(resourceMetadata),
+            selectedAuthServerUrl: redactUrlForLog(String(authServerUrl)),
+          },
+        );
       } catch (error) {
         logger.info(
           "[credentials:auth] Protected resource metadata unavailable; falling back to server URL",
-          error,
+          {
+            authId,
+            serverUrl: redactUrlForLog(serverUrl),
+            error: summarizeOAuthError(error),
+          },
         );
       }
 
       resource = resourceMetadata?.resource
         ? new URL(resourceMetadata.resource)
-        : new URL(serverUrl);
+        : undefined;
+      if (
+        explicitRequestedScopes === null &&
+        resourceMetadata?.scopes_supported?.length
+      ) {
+        requestedScopes = normalizeOAuthScopes(
+          resourceMetadata.scopes_supported,
+        );
+        logger.info("[credentials:auth] Using discovered OAuth scopes", {
+          authId,
+          scopeCount: requestedScopes.length,
+          scopes: requestedScopes,
+        });
+      } else {
+        logger.info("[credentials:auth] Using configured OAuth scopes", {
+          authId,
+          scopeCount: requestedScopes.length,
+          scopes: requestedScopes,
+        });
+      }
+
+      logger.info("[credentials:auth] Discovering authorization metadata", {
+        authId,
+        authServerUrl: redactUrlForLog(String(authServerUrl)),
+        resource: resource ? redactUrlForLog(resource.toString()) : undefined,
+      });
       oauthMetadata = await discoverAuthorizationServerMetadata(authServerUrl, {
-        fetchFn: fetch as any,
+        fetchFn: oauthFetch as any,
+      });
+      logger.info("[credentials:auth] Authorization metadata discovered", {
+        authId,
+        metadata: summarizeOAuthAuthorizationMetadata(oauthMetadata),
       });
 
+      const requestedScopeString = requestedScopes.join(" ");
       const clientMetadata: OAuthClientMetadata = {
         redirect_uris: [redirectUri],
         token_endpoint_auth_method: "none",
@@ -4716,23 +5239,35 @@ app.post(
         response_types: ["code"],
         client_name: "MCP Inspector",
         client_uri: "https://github.com/modelcontextprotocol/inspector",
-        scope: requestedScopes.join(" "),
+        ...(requestedScopeString ? { scope: requestedScopeString } : {}),
       };
 
       if (typeof clientId === "string" && clientId.trim()) {
         clientInformation = { client_id: clientId.trim() };
         logger.info(
           "[credentials:auth] Using existing credential client_id for OAuth authorization",
+          {
+            authId,
+            client: summarizeOAuthClientInformation(clientInformation),
+          },
         );
       } else {
+        logger.info("[credentials:auth] Registering OAuth client", {
+          authId,
+          authServerUrl: redactUrlForLog(String(authServerUrl)),
+          redirectUri,
+          scopeCount: requestedScopes.length,
+          hasScope: Boolean(requestedScopeString),
+        });
         clientInformation = await registerClient(authServerUrl, {
           metadata: oauthMetadata ?? undefined,
           clientMetadata,
-          fetchFn: fetch as any,
+          fetchFn: oauthFetch as any,
         });
-        logger.info(
-          "[credentials:auth] Registered OAuth client for credential authorization",
-        );
+        logger.info("[credentials:auth] Registered OAuth client", {
+          authId,
+          client: summarizeOAuthClientInformation(clientInformation),
+        });
       }
 
       oauthState = randomBytes(32).toString("base64url");
@@ -4740,7 +5275,7 @@ app.post(
         metadata: oauthMetadata ?? undefined,
         clientInformation,
         redirectUrl: redirectUri,
-        scope: requestedScopes.join(" ") || undefined,
+        scope: requestedScopeString || undefined,
         state: oauthState,
         resource,
       });
@@ -4748,6 +5283,13 @@ app.post(
 
       status.authorizationUrl = authorization.authorizationUrl.toString();
       status.redirectUri = redirectUri;
+      logger.info("[credentials:auth] OAuth authorization URL ready", {
+        authId,
+        authorizationUrl: redactUrlForLog(status.authorizationUrl),
+        redirectUri,
+        resource: resource ? redactUrlForLog(resource.toString()) : undefined,
+        scopeCount: requestedScopes.length,
+      });
       res.json({
         success: true,
         authId,
@@ -4759,10 +5301,13 @@ app.post(
     } catch (error: any) {
       callbackServer?.close();
       credentialOAuthStatuses.delete(authId);
-      logger.error("[credentials:auth] Failed to start OAuth flow:", error);
+      logger.error(
+        "[credentials:auth] Failed to start OAuth flow:",
+        summarizeOAuthError(error),
+      );
       res.status(500).json({
         error: "OAuth Start Failed",
-        message: error?.message || String(error),
+        message: getOAuthErrorMessage(error),
       });
     }
   },

@@ -105,7 +105,7 @@ const ToolsTab = ({
   resourceContent: Record<string, string>;
   onReadResource?: (uri: string) => void;
   currentServerConfig?: Record<string, unknown>;
-  loadedServers?: Record<string, any>;
+  loadedServers?: Record<string, Record<string, unknown>>;
   config?: InspectorConfig;
   credentialsFolderPath?: string;
   rawCredentials?: RawCredentials | null;
@@ -327,10 +327,8 @@ const ToolsTab = ({
     (tool: Tool, toolParams: Record<string, unknown>) => {
       const proxyUrl = "http://localhost:6277";
       const rawServer = currentServerConfig || { type: "stdio" };
-      const { env: _ignoredEnv, ...server } = rawServer as Record<
-        string,
-        unknown
-      >;
+      const server = { ...(rawServer as Record<string, unknown>) };
+      delete server.env;
 
       // For n8n workflow servers, only include the single relevant .n8n file
       const N8N_PREFIX = ["exec", "n8n-atom-cli", "mcp"];
@@ -366,8 +364,9 @@ const ToolsTab = ({
 
         const matchingKey = Object.keys(rawCredentials || {}).find(
           (key) =>
-            normalizeCredentialUrl(rawCredentials?.[key]?.server_url) ===
-            serverUrl,
+            normalizeCredentialUrl(
+              rawCredentials?.[key]?.server_url || rawCredentials?.[key]?.url,
+            ) === serverUrl,
         );
         const matchingCredential = matchingKey
           ? rawCredentials?.[matchingKey]
