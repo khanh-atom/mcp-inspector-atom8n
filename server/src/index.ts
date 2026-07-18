@@ -30,6 +30,7 @@ import {
   discoverAuthorizationServerMetadata,
   discoverOAuthProtectedResourceMetadata,
   exchangeAuthorization,
+  refreshAuthorization,
   registerClient,
   startAuthorization,
 } from "@modelcontextprotocol/sdk/client/auth.js";
@@ -2075,6 +2076,9 @@ interface CredentialRecord {
   server_name?: string;
   server_url?: string;
   client_id?: string;
+  client_secret?: string;
+  client_id_issued_at?: number;
+  client_secret_expires_at?: number;
   access_token?: string;
   expires_at?: number;
   refresh_token?: string;
@@ -2342,14 +2346,14 @@ async function writeCredentialOAuthTokens({
   meta,
   serverName,
   serverUrl,
-  clientId,
+  clientInformation,
   tokens,
   fallbackScopes = [],
 }: {
   meta: CredentialMeta;
   serverName: string;
   serverUrl: string;
-  clientId: string;
+  clientInformation: OAuthClientInformation;
   tokens: OAuthTokens & { expires_at?: number; scopes?: string[] };
   fallbackScopes?: string[];
 }): Promise<number | null> {
@@ -2391,9 +2395,22 @@ async function writeCredentialOAuthTokens({
         : existingCredential.url || existingCredential.server_url || "",
     type: existingCredential.type || "http",
     client_id:
-      typeof clientId === "string" && clientId.trim()
-        ? clientId.trim()
+      typeof clientInformation.client_id === "string" &&
+      clientInformation.client_id.trim()
+        ? clientInformation.client_id.trim()
         : existingCredential.client_id || "",
+    client_secret:
+      typeof clientInformation.client_secret === "string"
+        ? clientInformation.client_secret
+        : existingCredential.client_secret,
+    client_id_issued_at:
+      typeof clientInformation.client_id_issued_at === "number"
+        ? clientInformation.client_id_issued_at
+        : existingCredential.client_id_issued_at,
+    client_secret_expires_at:
+      typeof clientInformation.client_secret_expires_at === "number"
+        ? clientInformation.client_secret_expires_at
+        : existingCredential.client_secret_expires_at,
     access_token: tokens.access_token,
     expires_at: expiresAt ?? undefined,
     refresh_token:
@@ -2853,53 +2870,132 @@ async function refreshCredentialToken(
     );
   }
 
-  // Derive token endpoint from server URL
-  const serverUrl = new URL(credentialServerUrl);
-  const apiHost = serverUrl.hostname.replace(/^mcp\./, "api.");
-  const tokenUrl = `https://${apiHost}/oauth2/v1/token`;
-
   logger.info(
-    `[credentials:refreshHelper] Token refresh URL: ${tokenUrl} for server: ${cred.server_name || meta.credentialKey}`,
+    "[credentials:refreshHelper] Discovering OAuth protected resource metadata",
+    {
+      credentialKey: meta.credentialKey,
+      serverUrl: redactUrlForLog(credentialServerUrl),
+    },
   );
 
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: cred.refresh_token,
+  let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
+  let authServerUrl: string | URL = credentialServerUrl;
+  try {
+    resourceMetadata = await discoverOAuthProtectedResourceMetadata(
+      credentialServerUrl,
+      undefined,
+      oauthFetch as any,
+    );
+    if (resourceMetadata?.authorization_servers?.length) {
+      authServerUrl = resourceMetadata.authorization_servers[0];
+    }
+    logger.info(
+      "[credentials:refreshHelper] Protected resource metadata discovered",
+      {
+        credentialKey: meta.credentialKey,
+        metadata: summarizeOAuthProtectedResourceMetadata(resourceMetadata),
+        selectedAuthServerUrl: redactUrlForLog(String(authServerUrl)),
+      },
+    );
+  } catch (error) {
+    logger.warn(
+      "[credentials:refreshHelper] Protected resource metadata unavailable; falling back to server URL",
+      {
+        credentialKey: meta.credentialKey,
+        serverUrl: redactUrlForLog(credentialServerUrl),
+        error: summarizeOAuthError(error),
+      },
+    );
+  }
+
+  const resource = resourceMetadata?.resource
+    ? new URL(resourceMetadata.resource)
+    : undefined;
+  const oauthMetadata = await discoverAuthorizationServerMetadata(
+    authServerUrl,
+    { fetchFn: oauthFetch as any },
+  );
+  logger.info("[credentials:refreshHelper] Authorization metadata discovered", {
+    credentialKey: meta.credentialKey,
+    authServerUrl: redactUrlForLog(String(authServerUrl)),
+    resource: resource ? redactUrlForLog(resource.toString()) : undefined,
+    metadata: summarizeOAuthAuthorizationMetadata(oauthMetadata),
+  });
+
+  const clientInformation: OAuthClientInformation = {
     client_id: cred.client_id,
-  });
+    ...(cred.client_secret ? { client_secret: cred.client_secret } : {}),
+    ...(typeof cred.client_id_issued_at === "number"
+      ? { client_id_issued_at: cred.client_id_issued_at }
+      : {}),
+    ...(typeof cred.client_secret_expires_at === "number"
+      ? { client_secret_expires_at: cred.client_secret_expires_at }
+      : {}),
+  };
+  const tokenAuthMethods =
+    oauthMetadata?.token_endpoint_auth_methods_supported ?? [];
+  const requiresClientSecret =
+    !tokenAuthMethods.includes("none") &&
+    (tokenAuthMethods.includes("client_secret_basic") ||
+      tokenAuthMethods.includes("client_secret_post"));
 
-  const tokenResp = await fetch(tokenUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-
-  if (!tokenResp.ok) {
-    const text = await tokenResp.text();
-    throw new Error(`Token refresh failed (${tokenResp.status}): ${text}`);
+  if (requiresClientSecret && !clientInformation.client_secret) {
+    throw new Error(
+      `Credential '${meta.credentialKey}' is missing the client_secret required by the OAuth server. Authenticate this credential again once, then refresh will work automatically.`,
+    );
   }
 
-  const data = (await tokenResp.json()) as any;
-  if (!data.access_token) {
-    throw new Error("Token refresh response did not include access_token");
+  logger.info("[credentials:refreshHelper] Requesting refreshed OAuth token", {
+    credentialKey: meta.credentialKey,
+    serverName: cred.server_name || meta.credentialKey,
+    tokenEndpoint: redactUrlForLog(oauthMetadata?.token_endpoint),
+    tokenEndpointAuthMethods: tokenAuthMethods,
+    client: summarizeOAuthClientInformation(clientInformation),
+    hasResource: Boolean(resource),
+  });
+
+  let tokens: OAuthTokens;
+  try {
+    tokens = await refreshAuthorization(authServerUrl, {
+      metadata: oauthMetadata ?? undefined,
+      clientInformation,
+      refreshToken: cred.refresh_token,
+      resource,
+      fetchFn: oauthFetch as any,
+    });
+  } catch (error) {
+    logger.error(
+      "[credentials:refreshHelper] OAuth token refresh request failed",
+      {
+        credentialKey: meta.credentialKey,
+        authServerUrl: redactUrlForLog(String(authServerUrl)),
+        tokenEndpoint: redactUrlForLog(oauthMetadata?.token_endpoint),
+        error: summarizeOAuthError(error),
+      },
+    );
+    throw error;
   }
-  const expiresAt = Date.now() + (data.expires_in ?? 3600) * 1000;
 
-  // Update credential in memory
-  cred.access_token = data.access_token;
-  cred.refresh_token = data.refresh_token ?? cred.refresh_token;
-  cred.expires_at = expiresAt;
-  credentials[meta.credentialKey] = cred;
-
-  // Write back to the specific file
-  await fs.writeFile(filePath, JSON.stringify(credentials, null, 4), "utf8");
+  const tokensToStore: OAuthTokens & { expires_at?: number } = { ...tokens };
+  if (typeof tokens.expires_in !== "number") {
+    tokensToStore.expires_at = Date.now() + 60 * 60 * 1000;
+  }
+  const storedExpiresAt = await writeCredentialOAuthTokens({
+    meta,
+    serverName: cred.server_name || meta.credentialKey.split("|")[0],
+    serverUrl: credentialServerUrl,
+    clientInformation,
+    tokens: tokensToStore,
+    fallbackScopes: cred.scopes,
+  });
+  const expiresAt = storedExpiresAt ?? tokensToStore.expires_at!;
 
   logger.info(
-    `[credentials:refreshHelper] Token refreshed & saved for '${meta.credentialKey}' in ${meta.sourceFile}. New expiry: ${new Date(cred.expires_at).toISOString()}`,
+    `[credentials:refreshHelper] Token refreshed & saved for '${meta.credentialKey}' in ${meta.sourceFile}. New expiry: ${new Date(expiresAt).toISOString()}`,
   );
 
   return {
-    accessToken: data.access_token,
+    accessToken: tokens.access_token,
     expiresAt,
     expiresInMs: expiresAt - Date.now(),
   };
@@ -4642,7 +4738,7 @@ app.post(
         expiresInMs: result.expiresInMs,
       });
     } catch (error: any) {
-      logger.error(`[credentials:refresh] Error:`, error);
+      logger.error("[credentials:refresh] Error:", summarizeOAuthError(error));
       const statusCode = error?.message?.includes("not found")
         ? 404
         : error?.message?.includes("missing")
@@ -4739,7 +4835,7 @@ app.get(
         meta: flow.meta,
         serverName: flow.credentialServerName,
         serverUrl: flow.serverUrl,
-        clientId: flow.clientInformation.client_id,
+        clientInformation: flow.clientInformation,
         tokens,
         fallbackScopes: flow.requestedScopes,
       });
@@ -4816,6 +4912,8 @@ app.post(
         sourceFile,
         credentialKey,
       };
+      const credentialRecords = await readCredentialFile(meta);
+      const storedCredential = credentialRecords[credentialKey];
       const credentialServerName =
         typeof serverName === "string" && serverName.trim()
           ? serverName.trim()
@@ -5093,7 +5191,7 @@ app.post(
               meta,
               serverName: credentialServerName,
               serverUrl,
-              clientId: clientInformation.client_id,
+              clientInformation,
               tokens,
               fallbackScopes: requestedScopes,
             });
@@ -5232,9 +5330,18 @@ app.post(
       });
 
       const requestedScopeString = requestedScopes.join(" ");
+      const tokenAuthMethods =
+        oauthMetadata?.token_endpoint_auth_methods_supported ?? [];
+      const registrationAuthMethod = tokenAuthMethods.includes("none")
+        ? "none"
+        : tokenAuthMethods.includes("client_secret_basic")
+          ? "client_secret_basic"
+          : tokenAuthMethods.includes("client_secret_post")
+            ? "client_secret_post"
+            : "none";
       const clientMetadata: OAuthClientMetadata = {
         redirect_uris: [redirectUri],
-        token_endpoint_auth_method: "none",
+        token_endpoint_auth_method: registrationAuthMethod,
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
         client_name: "MCP Inspector",
@@ -5242,22 +5349,69 @@ app.post(
         ...(requestedScopeString ? { scope: requestedScopeString } : {}),
       };
 
-      if (typeof clientId === "string" && clientId.trim()) {
-        clientInformation = { client_id: clientId.trim() };
+      const requestedClientId =
+        typeof clientId === "string" && clientId.trim()
+          ? clientId.trim()
+          : storedCredential?.client_id?.trim() || "";
+      const storedClientSecret =
+        storedCredential?.client_id === requestedClientId
+          ? storedCredential.client_secret
+          : undefined;
+      const existingClientInformation: OAuthClientInformation | null =
+        requestedClientId
+          ? {
+              client_id: requestedClientId,
+              ...(storedClientSecret
+                ? { client_secret: storedClientSecret }
+                : {}),
+              ...(typeof storedCredential?.client_id_issued_at === "number"
+                ? { client_id_issued_at: storedCredential.client_id_issued_at }
+                : {}),
+              ...(typeof storedCredential?.client_secret_expires_at === "number"
+                ? {
+                    client_secret_expires_at:
+                      storedCredential.client_secret_expires_at,
+                  }
+                : {}),
+            }
+          : null;
+      const requiresClientSecret =
+        !tokenAuthMethods.includes("none") &&
+        (tokenAuthMethods.includes("client_secret_basic") ||
+          tokenAuthMethods.includes("client_secret_post"));
+
+      if (
+        existingClientInformation &&
+        (!requiresClientSecret || existingClientInformation.client_secret)
+      ) {
+        clientInformation = existingClientInformation;
         logger.info(
-          "[credentials:auth] Using existing credential client_id for OAuth authorization",
+          "[credentials:auth] Using existing OAuth client registration",
           {
             authId,
             client: summarizeOAuthClientInformation(clientInformation),
           },
         );
       } else {
+        if (existingClientInformation && requiresClientSecret) {
+          logger.warn(
+            "[credentials:auth] Existing OAuth client is missing its required client_secret; registering a replacement",
+            {
+              authId,
+              client: summarizeOAuthClientInformation(
+                existingClientInformation,
+              ),
+              tokenEndpointAuthMethods: tokenAuthMethods,
+            },
+          );
+        }
         logger.info("[credentials:auth] Registering OAuth client", {
           authId,
           authServerUrl: redactUrlForLog(String(authServerUrl)),
           redirectUri,
           scopeCount: requestedScopes.length,
           hasScope: Boolean(requestedScopeString),
+          tokenEndpointAuthMethod: registrationAuthMethod,
         });
         clientInformation = await registerClient(authServerUrl, {
           metadata: oauthMetadata ?? undefined,
@@ -5357,6 +5511,7 @@ app.post(
         serverName,
         serverUrl,
         clientId,
+        clientSecret,
         tokens,
       } = req.body;
 
@@ -5381,7 +5536,12 @@ app.post(
         meta,
         serverName,
         serverUrl,
-        clientId,
+        clientInformation: {
+          client_id: typeof clientId === "string" ? clientId : "",
+          ...(typeof clientSecret === "string"
+            ? { client_secret: clientSecret }
+            : {}),
+        },
         tokens,
       });
 
