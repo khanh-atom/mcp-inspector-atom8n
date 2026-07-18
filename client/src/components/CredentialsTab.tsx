@@ -199,6 +199,7 @@ const CredentialsTab = ({
   );
   const [createCredentialUrl, setCreateCredentialUrl] = useState("");
   const [isCreatingCredential, setIsCreatingCredential] = useState(false);
+  const [deletingFileName, setDeletingFileName] = useState<string | null>(null);
   const dragCounterRef = useRef(0);
   const { toast } = useToast();
 
@@ -581,6 +582,62 @@ const CredentialsTab = ({
     setCredentialsFolderPath,
     toast,
   ]);
+
+  const handleDeleteCredentialFile = useCallback(
+    async (fileName: string) => {
+      if (!credentialsFolderPath) return;
+      if (
+        !window.confirm(
+          `Delete ${fileName}? This permanently deletes the JSON file and all credentials stored in it.`,
+        )
+      ) {
+        return;
+      }
+
+      setDeletingFileName(fileName);
+      try {
+        const baseUrl = getMCPProxyAddress(config);
+        const { token, header } = getMCPProxyAuthToken(config);
+        const resp = await fetch(`${baseUrl}/credentials/file`, {
+          method: "DELETE",
+          headers: {
+            "Content-Type": "application/json",
+            [header]: token ? `Bearer ${token}` : "",
+          },
+          body: JSON.stringify({
+            folderPath: credentialsFolderPath,
+            fileName,
+          }),
+        });
+
+        if (!resp.ok) {
+          const error = await resp.json().catch(() => ({}));
+          throw new Error(
+            error.message || `Failed to delete file (${resp.status})`,
+          );
+        }
+
+        toast({
+          title: "Credential File Deleted",
+          description: `Deleted ${fileName}`,
+        });
+        await loadCredentials(credentialsFolderPath);
+      } catch (error) {
+        console.error(
+          "[CredentialsTab] Error deleting credential file:",
+          error,
+        );
+        toast({
+          title: "Delete Failed",
+          description: error instanceof Error ? error.message : String(error),
+          variant: "destructive",
+        });
+      } finally {
+        setDeletingFileName(null);
+      }
+    },
+    [config, credentialsFolderPath, loadCredentials, toast],
+  );
 
   // [DRAG-DROP] Handle file drop — read content and upload to server into the selected folder
   const handleFileDrop = useCallback(
@@ -2089,6 +2146,22 @@ const CredentialsTab = ({
                   <Badge variant="outline" className="text-[10px] px-1.5 py-0">
                     {fileEntries.length}
                   </Badge>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 ml-auto text-xs text-destructive hover:text-destructive"
+                    onClick={() => void handleDeleteCredentialFile(fileName)}
+                    disabled={deletingFileName !== null}
+                    title={`Delete ${fileName}`}
+                    aria-label={`Delete credential file ${fileName}`}
+                  >
+                    {deletingFileName === fileName ? (
+                      <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-3.5 h-3.5 mr-1" />
+                    )}
+                    Delete file
+                  </Button>
                 </div>
 
                 {/* Entries for this file */}
@@ -2543,7 +2616,8 @@ const CredentialsTab = ({
                   />
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  credentials.json in {credentialsFolderPath || "./data"}
+                  A new JSON file will be created in{" "}
+                  {credentialsFolderPath || "./data"}.
                 </p>
               </div>
               <DialogFooter>

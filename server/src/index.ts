@@ -2718,11 +2718,14 @@ function deriveCredentialServerName(serverUrl: string): string {
   }
 }
 
-function normalizeCredentialSourceFileName(fileName: unknown): string {
+function normalizeCredentialSourceFileName(
+  fileName: unknown,
+  defaultFileName = "credentials.json",
+): string {
   const targetFile =
     typeof fileName === "string" && fileName.trim()
       ? fileName.trim()
-      : "credentials.json";
+      : defaultFileName;
 
   if (
     !targetFile.endsWith(".json") ||
@@ -2735,6 +2738,32 @@ function normalizeCredentialSourceFileName(fileName: unknown): string {
   }
 
   return targetFile;
+}
+
+async function writeNewCredentialFile(
+  folder: string,
+  preferredFileName: string,
+  credentials: Record<string, CredentialRecord>,
+): Promise<string> {
+  const extension = ".json";
+  const baseName = preferredFileName.slice(0, -extension.length);
+
+  for (let suffix = 1; ; suffix += 1) {
+    const fileName = `${baseName}${suffix === 1 ? "" : `-${suffix}`}${extension}`;
+    const filePath = path.join(folder, fileName);
+
+    try {
+      await fs.writeFile(filePath, JSON.stringify(credentials, null, 4), {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      return fileName;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
 }
 
 function createUniqueCredentialKey(
@@ -4564,7 +4593,7 @@ app.put(
   },
 );
 
-// POST /credentials/create — Add a single URL-based credential to the folder.
+// POST /credentials/create — Add a single URL-based credential in a new file.
 app.post(
   "/credentials/create",
   originValidationMiddleware,
@@ -4615,39 +4644,18 @@ app.post(
         return;
       }
 
-      const targetFile = normalizeCredentialSourceFileName(fileName);
       const folder = path.resolve(expandTildePath(folderPath));
       await fs.mkdir(folder, { recursive: true });
-
-      const metaBase: CredentialMeta = {
-        folderPath,
-        sourceFile: targetFile,
-        credentialKey: "",
-      };
-      const filePath = credentialFilePath(metaBase);
-      let credentials: Record<string, CredentialRecord> = {};
-
-      try {
-        const fileContent = await fs.readFile(filePath, "utf8");
-        if (fileContent.trim()) {
-          const parsed = JSON.parse(fileContent);
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            throw new Error("Credentials file must contain a JSON object");
-          }
-          credentials = parsed as Record<string, CredentialRecord>;
-        }
-      } catch (error: any) {
-        if (error?.code !== "ENOENT") {
-          throw new Error(
-            `Credentials file not found or invalid: ${filePath} — ${error?.message || String(error)}`,
-          );
-        }
-      }
 
       const credentialServerName =
         typeof serverName === "string" && serverName.trim()
           ? serverName.trim()
           : deriveCredentialServerName(rawServerUrl);
+      const preferredFileName = normalizeCredentialSourceFileName(
+        fileName,
+        `${sanitizeCredentialServerName(credentialServerName) || "credential"}.json`,
+      );
+      const credentials: Record<string, CredentialRecord> = {};
       const credentialKey = createUniqueCredentialKey(
         credentialServerName,
         credentials,
@@ -4664,11 +4672,12 @@ app.post(
         scopes: [],
       };
 
-      await fs.writeFile(
-        filePath,
-        JSON.stringify(credentials, null, 4),
-        "utf8",
+      const targetFile = await writeNewCredentialFile(
+        folder,
+        preferredFileName,
+        credentials,
       );
+      const filePath = path.join(folder, targetFile);
       setActiveCredentialsFolderPath(folderPath, "POST /credentials/create");
 
       const entry = parseCredentialFile(
@@ -4690,6 +4699,65 @@ app.post(
       });
     } catch (error: any) {
       logger.error("[credentials:create] Error:", error);
+      const message = error?.message || String(error);
+      const statusCode = message.includes("Invalid credential source file")
+        ? 400
+        : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? "Bad Request" : "Internal Server Error",
+        message,
+      });
+    }
+  },
+);
+
+// DELETE /credentials/file — Delete one credentials JSON file from the folder.
+app.delete(
+  "/credentials/file",
+  originValidationMiddleware,
+  authMiddleware,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { folderPath: rawFolder, fileName } = req.body;
+      const folderPath = typeof rawFolder === "string" ? rawFolder.trim() : "";
+
+      if (!folderPath || typeof fileName !== "string" || !fileName.trim()) {
+        res.status(400).json({
+          error: "Bad Request",
+          message: "'folderPath' and 'fileName' are required",
+        });
+        return;
+      }
+
+      const targetFile = normalizeCredentialSourceFileName(fileName);
+      const filePath = credentialFilePath({
+        folderPath,
+        sourceFile: targetFile,
+        credentialKey: "",
+      });
+
+      try {
+        await fs.unlink(filePath);
+      } catch (error: any) {
+        if (error?.code === "ENOENT") {
+          res.status(404).json({
+            error: "Not Found",
+            message: `Credential file not found: ${targetFile}`,
+          });
+          return;
+        }
+        throw error;
+      }
+
+      logger.info(`[credentials:file] Deleted credential file: ${filePath}`);
+      res.json({
+        success: true,
+        fileName: targetFile,
+        message: `Deleted ${targetFile}`,
+      });
+    } catch (error: any) {
+      logger.error("[credentials:file] Delete error:", error);
       const message = error?.message || String(error);
       const statusCode = message.includes("Invalid credential source file")
         ? 400
