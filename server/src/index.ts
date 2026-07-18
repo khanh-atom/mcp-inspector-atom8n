@@ -305,6 +305,69 @@ const sessionHeaderHolders: Map<
   { headers: HeadersInit; preserveAuthorization?: boolean }
 > = new Map(); // For dynamic header updates
 
+const traceMcpHttpLifecycle = (req: express.Request, res: express.Response) => {
+  const startedAt = Date.now();
+  const sessionIdHeader = req.headers["mcp-session-id"];
+  const sessionId = Array.isArray(sessionIdHeader)
+    ? sessionIdHeader.at(-1)
+    : sessionIdHeader;
+  let responseFinished = false;
+
+  logger.info(`[/mcp:http] ${req.method} started`, {
+    session: summarizeSessionIdForLog(sessionId),
+    accept: req.headers.accept ?? "<none>",
+    contentType: req.headers["content-type"] ?? "<none>",
+    protocol: req.headers["mcp-protocol-version"] ?? "<none>",
+    lastEventId: req.headers["last-event-id"] ? "present" : "absent",
+    activeClientTransports: webAppTransports.size,
+    activeServerTransports: serverTransports.size,
+  });
+
+  req.once("aborted", () => {
+    logger.warn(`[/mcp:http] ${req.method} request aborted`, {
+      session: summarizeSessionIdForLog(sessionId),
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
+
+  res.once("finish", () => {
+    responseFinished = true;
+    logger.info(`[/mcp:http] ${req.method} response finished`, {
+      session: summarizeSessionIdForLog(sessionId),
+      status: res.statusCode,
+      contentType: res.getHeader("content-type") ?? "<none>",
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
+
+  res.once("close", () => {
+    if (!responseFinished) {
+      logger.warn(`[/mcp:http] ${req.method} response stream closed`, {
+        session: summarizeSessionIdForLog(sessionId),
+        status: res.statusCode,
+        headersSent: res.headersSent,
+        writableEnded: res.writableEnded,
+        elapsedMs: Date.now() - startedAt,
+      });
+    }
+  });
+
+  return () => {
+    logger.info(`[/mcp:http] ${req.method} transport handler returned`, {
+      session: summarizeSessionIdForLog(sessionId),
+      status: res.statusCode,
+      headersSent: res.headersSent,
+      writableEnded: res.writableEnded,
+      contentType: res.getHeader("content-type") ?? "<none>",
+      elapsedMs: Date.now() - startedAt,
+      note:
+        req.method === "GET" && !res.writableEnded
+          ? "SSE stream is open; waiting for server messages"
+          : undefined,
+    });
+  };
+};
+
 // Cache for execute-tool connections: reuse client+transport per serverName
 type CachedExecuteToolConnection = { client: Client; transport: Transport };
 const executeToolConnectionCache = new Map<
@@ -456,11 +519,22 @@ const createWebReadableStream = (nodeStream: any): ReadableStream => {
  * `Content-Type` are preserved. For SSE requests, it also converts Node.js
  * streams to web-compatible streams.
  */
+let upstreamHttpRequestSequence = 0;
+
+const summarizeSessionIdForLog = (sessionId: string | null | undefined) => {
+  if (!sessionId) return "<none>";
+  if (sessionId.length <= 24) return sessionId;
+  return `${sessionId.slice(0, 10)}…${sessionId.slice(-6)} (length=${sessionId.length})`;
+};
+
 const createCustomFetch = (headerHolder: { headers: HeadersInit }) => {
   return async (
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> => {
+    const requestId = ++upstreamHttpRequestSequence;
+    const startedAt = Date.now();
+
     // Determine the headers from the original request/init.
     // The SDK may pass a Request object or a URL and an init object.
     const originalHeaders =
@@ -481,10 +555,36 @@ const createCustomFetch = (headerHolder: { headers: HeadersInit }) => {
       headersObject[key] = value;
     });
 
-    // Get the response from node-fetch (cast input and init to handle type differences)
-    const response = await fetch(
-      input as any,
-      { ...init, headers: headersObject } as any,
+    const method = (
+      init?.method ?? (input instanceof Request ? input.method : "GET")
+    ).toUpperCase();
+    const rawUrl =
+      input instanceof Request
+        ? input.url
+        : input instanceof URL
+          ? input.toString()
+          : String(input);
+
+    console.log(
+      `[upstream:http#${requestId}] → ${method} ${redactUrlForLog(rawUrl)} accept=${JSON.stringify(finalHeaders.get("accept"))} contentType=${JSON.stringify(finalHeaders.get("content-type"))} authorization=${finalHeaders.has("authorization") ? "present" : "absent"} session=${summarizeSessionIdForLog(finalHeaders.get("mcp-session-id"))} protocol=${finalHeaders.get("mcp-protocol-version") ?? "<none>"}`,
+    );
+
+    let response: Awaited<ReturnType<typeof fetch>>;
+    try {
+      // Get the response from node-fetch (cast input and init to handle type differences)
+      response = await fetch(
+        input as any,
+        { ...init, headers: headersObject } as any,
+      );
+    } catch (error) {
+      console.error(
+        `[upstream:http#${requestId}] Network failure after ${Date.now() - startedAt}ms: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
+
+    console.log(
+      `[upstream:http#${requestId}] ← ${response.status} ${response.statusText || "<no status text>"} headersAfter=${Date.now() - startedAt}ms contentType=${JSON.stringify(response.headers.get("content-type"))} session=${summarizeSessionIdForLog(response.headers.get("mcp-session-id"))}`,
     );
 
     // Check if this is an SSE request by looking at the Accept header
@@ -492,10 +592,37 @@ const createCustomFetch = (headerHolder: { headers: HeadersInit }) => {
     const isSSE = acceptHeader?.includes("text/event-stream");
 
     if (isSSE && response.body) {
+      // Register the bridge's data listener before diagnostic listeners so
+      // instrumentation cannot consume an early chunk from a flowing stream.
+      const webStream = createWebReadableStream(response.body);
+      let bodyBytes = 0;
+      let bodyEnded = false;
+      response.body.on("data", (chunk: Buffer | string) => {
+        bodyBytes += Buffer.isBuffer(chunk)
+          ? chunk.length
+          : Buffer.byteLength(chunk);
+      });
+      response.body.once("end", () => {
+        bodyEnded = true;
+        console.log(
+          `[upstream:http#${requestId}] Response body ended after ${Date.now() - startedAt}ms bytes=${bodyBytes}`,
+        );
+      });
+      response.body.once("close", () => {
+        if (!bodyEnded) {
+          console.warn(
+            `[upstream:http#${requestId}] Response body closed before end after ${Date.now() - startedAt}ms bytes=${bodyBytes}`,
+          );
+        }
+      });
+      response.body.once("error", (error: Error) => {
+        console.error(
+          `[upstream:http#${requestId}] Response body error after ${Date.now() - startedAt}ms bytes=${bodyBytes}: ${error.message}`,
+        );
+      });
+
       // For SSE requests, we need to convert the Node.js stream to a web ReadableStream
       // because the EventSource polyfill expects web-compatible streams
-      const webStream = createWebReadableStream(response.body);
-
       // Create a new response with the web-compatible stream
       // Convert node-fetch headers to plain object for web Response compatibility
       const responseHeaders: Record<string, string> = {};
@@ -793,6 +920,7 @@ app.get(
   authMiddleware,
   async (req, res) => {
     bridgeInboundMcpProtocolVersion(req);
+    const logTransportHandlerReturned = traceMcpHttpLifecycle(req, res);
     const sessionId = req.headers["mcp-session-id"] as string;
     logger.info(`Received GET message for sessionId ${sessionId}`);
 
@@ -810,10 +938,15 @@ app.get(
         sessionId,
       ) as StreamableHTTPServerTransport;
       if (!transport) {
+        logger.warn("[/mcp:http] GET session transport was not found", {
+          session: summarizeSessionIdForLog(sessionId),
+          activeClientTransports: webAppTransports.size,
+        });
         res.status(404).end("Session not found");
         return;
       } else {
         await transport.handleRequest(req, res);
+        logTransportHandlerReturned();
       }
     } catch (error) {
       logger.error("Error in /mcp route:", error);
@@ -828,6 +961,7 @@ app.post(
   authMiddleware,
   async (req, res) => {
     bridgeInboundMcpProtocolVersion(req);
+    const logTransportHandlerReturned = traceMcpHttpLifecycle(req, res);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
     if (sessionId) {
@@ -846,12 +980,17 @@ app.post(
           sessionId,
         ) as StreamableHTTPServerTransport;
         if (!transport) {
+          logger.warn("[/mcp:http] POST session transport was not found", {
+            session: summarizeSessionIdForLog(sessionId),
+            activeClientTransports: webAppTransports.size,
+          });
           res.status(404).end("Transport not found for sessionId " + sessionId);
         } else {
           await (transport as StreamableHTTPServerTransport).handleRequest(
             req,
             res,
           );
+          logTransportHandlerReturned();
         }
       } catch (error) {
         console.error("Error in /mcp route:", error);
@@ -877,11 +1016,15 @@ app.post(
             webAppTransports.delete(sessionId);
             serverTransports.delete(sessionId);
             sessionHeaderHolders.delete(sessionId);
+            console.log(
+              `[/mcp] Session closed and transports removed: ${sessionId} (active client transports=${webAppTransports.size}, active server transports=${serverTransports.size})`,
+            );
           },
         });
         console.log("Created StreamableHttp client transport");
 
         await webAppTransport.start();
+        console.log("[/mcp] Streamable HTTP server transport started");
 
         // [PROXY] Determine allowed tools — check URL param first, then persisted state
         const allowedToolsParam = req.query.allowedTools as string | undefined;
@@ -941,12 +1084,14 @@ app.post(
           allowedTools: allowedToolsSet,
           onServerSendAuthError: headerHolder?.refreshAuthorization,
         });
+        console.log("[/mcp] MCP proxy message handlers attached");
 
         await (webAppTransport as StreamableHTTPServerTransport).handleRequest(
           req,
           res,
           req.body,
         );
+        logTransportHandlerReturned();
       } catch (error) {
         if (error instanceof SseError && error.code === 401) {
           console.error(

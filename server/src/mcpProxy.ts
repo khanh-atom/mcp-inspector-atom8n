@@ -17,6 +17,18 @@ function summarizeMessage(message: JSONRPCMessage): string {
   return JSON.stringify(message).slice(0, 100);
 }
 
+function summarizeSessionId(sessionId: string | undefined): string {
+  if (!sessionId) return "<none>";
+  if (sessionId.length <= 24) return sessionId;
+  return `${sessionId.slice(0, 10)}…${sessionId.slice(-6)} (length=${sessionId.length})`;
+}
+
+type PendingRequest = {
+  method: string;
+  startedAt: number;
+  warningTimer: ReturnType<typeof setTimeout>;
+};
+
 function onClientError(error: Error) {
   console.error("[mcpProxy] Error from inspector client:", error);
 }
@@ -131,8 +143,27 @@ export default function mcpProxy({
 
   // Track tools/list request IDs so we can filter the responses
   const pendingToolsListIds = new Set<string | number>();
+  const pendingRequests = new Map<string | number, PendingRequest>();
   let pendingInitializeRequestId: string | number | undefined;
+  let postInitializeIdleTimer: ReturnType<typeof setTimeout> | undefined;
   const isFiltering = allowedTools != null && allowedTools.size > 0;
+
+  const clearPendingRequest = (id: string | number) => {
+    const pendingRequest = pendingRequests.get(id);
+    if (pendingRequest) {
+      clearTimeout(pendingRequest.warningTimer);
+      pendingRequests.delete(id);
+    }
+    return pendingRequest;
+  };
+
+  const summarizePendingRequests = () =>
+    [...pendingRequests.entries()]
+      .map(
+        ([id, pending]) =>
+          `${pending.method} id=${id} age=${Date.now() - pending.startedAt}ms`,
+      )
+      .join(", ") || "none";
 
   if (isFiltering) {
     console.log(
@@ -143,10 +174,31 @@ export default function mcpProxy({
   }
 
   const forwardToServer = async (message: JSONRPCMessage) => {
+    if (postInitializeIdleTimer) {
+      clearTimeout(postInitializeIdleTimer);
+      postInitializeIdleTimer = undefined;
+    }
+
     console.log(`[mcpProxy] Client → Server: ${summarizeMessage(message)}`);
 
-    if (isJSONRPCRequest(message) && message.method === "initialize") {
-      pendingInitializeRequestId = message.id;
+    if (isJSONRPCRequest(message)) {
+      if (message.method === "initialize") {
+        pendingInitializeRequestId = message.id;
+      }
+
+      clearPendingRequest(message.id);
+      const startedAt = Date.now();
+      const warningTimer = setTimeout(() => {
+        console.warn(
+          `[mcpProxy] Still waiting for upstream response: method=${message.method} id=${message.id} elapsed=${Date.now() - startedAt}ms upstreamSession=${summarizeSessionId(transportToServer.sessionId)}`,
+        );
+      }, 10_000);
+      warningTimer.unref?.();
+      pendingRequests.set(message.id, {
+        method: message.method,
+        startedAt,
+        warningTimer,
+      });
     }
 
     // If filtering is active, check tools/call requests
@@ -159,13 +211,37 @@ export default function mcpProxy({
       // Block tools/call for disabled tools
       const errorResponse = checkToolCallAllowed(message, allowedTools!);
       if (errorResponse) {
-        transportToClient.send(errorResponse).catch(onClientError);
+        clearPendingRequest(message.id);
+        transportToClient
+          .send(errorResponse)
+          .then(() => {
+            console.log(
+              `[mcpProxy] Delivered local rejection to client: id=${message.id}`,
+            );
+          })
+          .catch(onClientError);
         return;
       }
     }
 
+    const sendStartedAt = Date.now();
     try {
       await transportToServer.send(message);
+      console.log(
+        `[mcpProxy] Upstream send accepted: ${summarizeMessage(message)} elapsed=${Date.now() - sendStartedAt}ms upstreamSession=${summarizeSessionId(transportToServer.sessionId)}`,
+      );
+
+      if (
+        "method" in message &&
+        message.method === "notifications/initialized"
+      ) {
+        postInitializeIdleTimer = setTimeout(() => {
+          console.warn(
+            `[mcpProxy] No client message received for 10s after notifications/initialized; bridge is idle (pending upstream requests: ${summarizePendingRequests()})`,
+          );
+        }, 10_000);
+        postInitializeIdleTimer.unref?.();
+      }
     } catch (error) {
       console.error(
         `[mcpProxy] Failed to send to server: ${getErrorMessage(error)}`,
@@ -179,6 +255,9 @@ export default function mcpProxy({
               "[mcpProxy] Retrying client message after credential refresh",
             );
             await transportToServer.send(message);
+            console.log(
+              `[mcpProxy] Upstream retry accepted: ${summarizeMessage(message)} elapsed=${Date.now() - sendStartedAt}ms upstreamSession=${summarizeSessionId(transportToServer.sessionId)}`,
+            );
             return;
           }
         } catch (retryError) {
@@ -191,7 +270,10 @@ export default function mcpProxy({
       }
 
       // Send error response back to client if it was a request (has id) and connection is still open
-      if (isJSONRPCRequest(message) && !transportToClientClosed) {
+      if (isJSONRPCRequest(message)) {
+        clearPendingRequest(message.id);
+        if (transportToClientClosed) return;
+
         const errorResponse = {
           jsonrpc: "2.0" as const,
           id: message.id,
@@ -201,7 +283,14 @@ export default function mcpProxy({
             data: error,
           },
         };
-        transportToClient.send(errorResponse).catch(onClientError);
+        transportToClient
+          .send(errorResponse)
+          .then(() => {
+            console.log(
+              `[mcpProxy] Delivered upstream send error to client: id=${message.id}`,
+            );
+          })
+          .catch(onClientError);
       }
     }
   };
@@ -211,6 +300,16 @@ export default function mcpProxy({
   };
 
   transportToServer.onmessage = (message) => {
+    let responseTiming = "";
+    if (("result" in message || "error" in message) && "id" in message) {
+      const pendingRequest = clearPendingRequest(message.id);
+      if (pendingRequest) {
+        responseTiming = ` request=${pendingRequest.method} upstreamElapsed=${Date.now() - pendingRequest.startedAt}ms`;
+      } else {
+        responseTiming = " request=<untracked>";
+      }
+    }
+
     if (
       pendingInitializeRequestId !== undefined &&
       "id" in message &&
@@ -232,12 +331,15 @@ export default function mcpProxy({
       if (transportToServer.sessionId) {
         // Can only report for StreamableHttp
         console.error(
-          "Proxy  <-> Server sessionId: " + transportToServer.sessionId,
+          "Proxy  <-> Server sessionId: " +
+            summarizeSessionId(transportToServer.sessionId),
         );
       }
       reportedServerSession = true;
     }
-    console.log(`[mcpProxy] Server → Client: ${summarizeMessage(message)}`);
+    console.log(
+      `[mcpProxy] Server → Client: ${summarizeMessage(message)}${responseTiming}`,
+    );
 
     // If filtering is active, filter tools/list responses
     let outMessage = message;
@@ -249,32 +351,48 @@ export default function mcpProxy({
       );
     }
 
-    transportToClient.send(outMessage).catch((error) => {
-      console.error(`[mcpProxy] Failed to send to client: ${error.message}`);
-    });
+    const clientSendStartedAt = Date.now();
+    transportToClient
+      .send(outMessage)
+      .then(() => {
+        console.log(
+          `[mcpProxy] Client send completed: ${summarizeMessage(outMessage)} elapsed=${Date.now() - clientSendStartedAt}ms`,
+        );
+      })
+      .catch((error) => {
+        console.error(`[mcpProxy] Failed to send to client: ${error.message}`);
+      });
   };
 
   transportToClient.onclose = () => {
     console.log(
-      `[mcpProxy] Client transport closed (serverAlreadyClosed=${transportToServerClosed})`,
+      `[mcpProxy] Client transport closed (serverAlreadyClosed=${transportToServerClosed}, pendingRequests=${summarizePendingRequests()})`,
     );
     if (transportToServerClosed) {
       return;
     }
 
     transportToClientClosed = true;
+    if (postInitializeIdleTimer) clearTimeout(postInitializeIdleTimer);
+    for (const requestId of pendingRequests.keys()) {
+      clearPendingRequest(requestId);
+    }
     console.log("[mcpProxy] Cascading close → server transport");
     transportToServer.close().catch(onServerError);
   };
 
   transportToServer.onclose = () => {
     console.log(
-      `[mcpProxy] Server transport closed (clientAlreadyClosed=${transportToClientClosed})`,
+      `[mcpProxy] Server transport closed (clientAlreadyClosed=${transportToClientClosed}, pendingRequests=${summarizePendingRequests()})`,
     );
     if (transportToClientClosed) {
       return;
     }
     transportToServerClosed = true;
+    if (postInitializeIdleTimer) clearTimeout(postInitializeIdleTimer);
+    for (const requestId of pendingRequests.keys()) {
+      clearPendingRequest(requestId);
+    }
     console.log("[mcpProxy] Cascading close → client transport");
     transportToClient.close().catch(onClientError);
   };
