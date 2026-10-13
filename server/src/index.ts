@@ -555,20 +555,6 @@ const createCustomFetch = (headerHolder: { headers: HeadersInit }) => {
       headersObject[key] = value;
     });
 
-    const method = (
-      init?.method ?? (input instanceof Request ? input.method : "GET")
-    ).toUpperCase();
-    const rawUrl =
-      input instanceof Request
-        ? input.url
-        : input instanceof URL
-          ? input.toString()
-          : String(input);
-
-    console.log(
-      `[upstream:http#${requestId}] → ${method} ${redactUrlForLog(rawUrl)} accept=${JSON.stringify(finalHeaders.get("accept"))} contentType=${JSON.stringify(finalHeaders.get("content-type"))} authorization=${finalHeaders.has("authorization") ? "present" : "absent"} session=${summarizeSessionIdForLog(finalHeaders.get("mcp-session-id"))} protocol=${finalHeaders.get("mcp-protocol-version") ?? "<none>"}`,
-    );
-
     let response: Awaited<ReturnType<typeof fetch>>;
     try {
       // Get the response from node-fetch (cast input and init to handle type differences)
@@ -582,10 +568,6 @@ const createCustomFetch = (headerHolder: { headers: HeadersInit }) => {
       );
       throw error;
     }
-
-    console.log(
-      `[upstream:http#${requestId}] ← ${response.status} ${response.statusText || "<no status text>"} headersAfter=${Date.now() - startedAt}ms contentType=${JSON.stringify(response.headers.get("content-type"))} session=${summarizeSessionIdForLog(response.headers.get("mcp-session-id"))}`,
-    );
 
     // Check if this is an SSE request by looking at the Accept header
     const acceptHeader = finalHeaders.get("Accept");
@@ -604,9 +586,6 @@ const createCustomFetch = (headerHolder: { headers: HeadersInit }) => {
       });
       response.body.once("end", () => {
         bodyEnded = true;
-        console.log(
-          `[upstream:http#${requestId}] Response body ended after ${Date.now() - startedAt}ms bytes=${bodyBytes}`,
-        );
       });
       response.body.once("close", () => {
         if (!bodyEnded) {
