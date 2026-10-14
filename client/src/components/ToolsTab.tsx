@@ -433,7 +433,7 @@ const ToolsTab = ({
 
   return (
     <TabsContent value="tools">
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,22rem),1fr))] gap-4">
         <ListPane
           items={tools}
           listItems={listTools}
@@ -447,9 +447,11 @@ const ToolsTab = ({
               ? findMatchingN8nFile(n8nFilePaths, tool.name)
               : undefined;
             return (
-              <div className="flex items-start gap-2">
+              <div className="flex flex-wrap items-start gap-2">
                 <div className="flex flex-col items-start flex-1 min-w-0">
-                  <span className="flex-1">{tool.name}</span>
+                  <span className="max-w-full [overflow-wrap:anywhere]">
+                    {tool.name}
+                  </span>
                   <span className="text-sm text-gray-500 text-left line-clamp-3">
                     {tool.description}
                   </span>
@@ -495,7 +497,7 @@ const ToolsTab = ({
           }}
         />
 
-        <div className="bg-card border border-border rounded-lg shadow">
+        <div className="min-w-0 bg-card border border-border rounded-lg shadow">
           <div className="p-4 border-b border-gray-200 dark:border-border">
             <h3 className="font-semibold">
               {selectedTool ? selectedTool.name : "Select a tool"}

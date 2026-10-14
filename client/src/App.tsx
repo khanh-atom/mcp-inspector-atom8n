@@ -43,6 +43,8 @@ import {
   Bell,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
   Files,
   FileText,
   FolderTree,
@@ -677,6 +679,7 @@ const App = () => {
   }, [activeTab]);
 
   const { height: historyPaneHeight, handleDragStart } = useDraggablePane(300);
+  const [isHistoryPaneCollapsed, setIsHistoryPaneCollapsed] = useState(true);
   const {
     width: sidebarWidth,
     isDragging: isSidebarDragging,
@@ -1999,18 +2002,53 @@ const App = () => {
             activeTab !== "store" &&
             activeTab !== "logger" && (
               <div
-                className="relative border-t border-border"
+                className="relative flex shrink-0 flex-col border-t border-border"
                 style={{
-                  height: `${historyPaneHeight}px`,
+                  height: isHistoryPaneCollapsed ? 44 : historyPaneHeight,
                 }}
               >
-                <div
-                  className="absolute w-full h-4 -top-2 cursor-row-resize flex items-center justify-center hover:bg-accent/50 dark:hover:bg-input/40"
-                  onMouseDown={handleDragStart}
+                {!isHistoryPaneCollapsed && (
+                  <div
+                    className="absolute w-full h-4 -top-2 cursor-row-resize flex items-center justify-center hover:bg-accent/50 dark:hover:bg-input/40"
+                    onMouseDown={handleDragStart}
+                  >
+                    <div className="w-8 h-1 rounded-full bg-border" />
+                  </div>
+                )}
+                <Button
+                  variant="ghost"
+                  className="h-11 w-full shrink-0 justify-between gap-2 rounded-none px-4"
+                  aria-label={
+                    isHistoryPaneCollapsed
+                      ? "Expand history and server notifications"
+                      : "Minimize history and server notifications"
+                  }
+                  title={
+                    isHistoryPaneCollapsed
+                      ? "Expand history and server notifications"
+                      : "Minimize history and server notifications"
+                  }
+                  aria-expanded={!isHistoryPaneCollapsed}
+                  aria-controls="history-and-notifications"
+                  onClick={() =>
+                    setIsHistoryPaneCollapsed((collapsed) => !collapsed)
+                  }
                 >
-                  <div className="w-8 h-1 rounded-full bg-border" />
-                </div>
-                <div className="h-full overflow-auto">
+                  <span className="min-w-0 truncate text-xs text-muted-foreground">
+                    History ({requestHistory.length}) · Server Notifications (
+                    {notifications.length})
+                  </span>
+                  {isHistoryPaneCollapsed ? (
+                    <ChevronUp className="h-4 w-4 shrink-0" />
+                  ) : (
+                    <ChevronDown className="h-4 w-4 shrink-0" />
+                  )}
+                </Button>
+                <div
+                  id="history-and-notifications"
+                  hidden={isHistoryPaneCollapsed}
+                  className="min-h-0 flex-1 overflow-auto"
+                >
                   <HistoryAndNotifications
                     requestHistory={requestHistory}
                     serverNotifications={notifications}
