@@ -133,6 +133,7 @@ const Sidebar = ({
   const [loadedServers, setLoadedServers] = useState<Record<string, any>>({});
   const [selectedServer, setSelectedServer] = useState<string>("");
   const [isLoadingDefault, setIsLoadingDefault] = useState<boolean>(false);
+  const [configLoadError, setConfigLoadError] = useState<string | null>(null);
   const [configCounts, setConfigCounts] = useState<Record<string, number>>({});
   const [activeConfigPath, setActiveConfigPath] = useState<string>(
     () => localStorage.getItem("activeConfigPath") || "",
@@ -215,18 +216,30 @@ const Sidebar = ({
   // otherwise the server defaults to ~/.cursor/mcp.json
   const loadDefaultConfig = useCallback(
     async (configPath?: string) => {
+      const requestedPath = configPath || "~/.cursor/mcp.json";
       setIsLoadingDefault(true);
+      setConfigLoadError(null);
+      setActiveConfigPath(requestedPath);
+      localStorage.setItem("activeConfigPath", requestedPath);
+      // Keep the file link, store target and server list on the selected config,
+      // even when the proxy cannot load it.
+      setConfigFilePath(requestedPath);
+      setLoadedServers({});
+      setSelectedServer("");
+      let baseUrl = "";
+      let requestId: string | null = null;
+      let responseReceived = false;
+      const startedAt = Date.now();
       try {
-        console.log(
-          "Attempting to load configuration from server /mcp-config",
-          configPath ? `(path=${configPath})` : "(default)",
-        );
-
-        const baseUrl = getMCPProxyAddress(config);
+        baseUrl = getMCPProxyAddress(config);
         const { token, header } = getMCPProxyAuthToken(config);
-        const url = configPath
-          ? `${baseUrl}/mcp-config?path=${encodeURIComponent(configPath)}`
-          : `${baseUrl}/mcp-config`;
+        const url = `${baseUrl}/mcp-config?path=${encodeURIComponent(requestedPath)}`;
+        console.info("[mcp-config] Loading configuration", {
+          requestedPath,
+          proxyAddress: redactUrlForLog(baseUrl),
+          pageOrigin: window.location.origin,
+          hasAuthToken: Boolean(token),
+        });
 
         const resp = await fetch(url, {
           method: "GET",
@@ -235,47 +248,56 @@ const Sidebar = ({
             [header]: token ? `Bearer ${token}` : "",
           },
         });
+        responseReceived = true;
+        requestId = resp.headers.get("X-MCP-Config-Request-Id");
+        console.info("[mcp-config] Proxy response", {
+          requestedPath,
+          requestId,
+          status: resp.status,
+          elapsedMs: Date.now() - startedAt,
+        });
 
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({}));
-          console.error("Failed to load MCP config:", err);
-          if (configPath) {
-            toast({
-              title: "Error",
-              description: `Failed to load config from ${configPath}: ${err.message || resp.statusText}`,
-              variant: "destructive",
-            });
-          }
-          return;
+          throw new Error(
+            `HTTP ${resp.status}: ${err.message || resp.statusText}`,
+          );
         }
 
         const data = await resp.json();
-        console.log("MCP config loaded:", data);
-        console.log("data.path:", data.path);
-        console.log("resp.ok:", resp.ok);
+        if (
+          !data.config ||
+          typeof data.config !== "object" ||
+          Array.isArray(data.config) ||
+          typeof data.path !== "string" ||
+          !data.path
+        ) {
+          throw new Error(
+            "The proxy returned an invalid configuration response",
+          );
+        }
 
         const configData = data.config as any;
-        console.log("configData:", configData);
         const servers = (configData.servers || configData.mcpServers) as
           | Record<string, any>
           | undefined;
-        console.log("servers:", servers);
-
-        if (typeof data.path === "string" && data.path) {
-          console.log("Setting configFilePath to:", data.path);
-          hasLoadedConfig.current = true;
-          setConfigFilePath(data.path);
-        } else {
-          console.warn("data.path is not a valid string:", data.path);
+        if (
+          servers &&
+          (typeof servers !== "object" || Array.isArray(servers))
+        ) {
+          throw new Error("The configuration's MCP servers must be an object");
         }
+        hasLoadedConfig.current = true;
+        setConfigFilePath(data.path);
+        console.info("[mcp-config] Configuration loaded", {
+          requestedPath,
+          resolvedPath: data.path,
+          requestId,
+          serverCount: servers ? Object.keys(servers).length : 0,
+        });
 
         if (!servers || Object.keys(servers).length === 0) {
-          console.log("No servers found, clearing loadedServers");
-          setLoadedServers({});
-          setSelectedServer("");
-          if (configPath) {
-            setConfigCounts((prev) => ({ ...prev, [configPath]: 0 }));
-          }
+          setConfigCounts((prev) => ({ ...prev, [requestedPath]: 0 }));
           return;
         }
 
@@ -286,15 +308,25 @@ const Sidebar = ({
           applyServerConfig(servers[names[0]]);
         }
 
-        if (configPath) {
-          setConfigCounts((prev) => ({ ...prev, [configPath]: names.length }));
-        }
+        setConfigCounts((prev) => ({ ...prev, [requestedPath]: names.length }));
       } catch (error) {
-        console.error("Error loading config:", error);
+        const reason = error instanceof Error ? error.message : String(error);
+        const description = responseReceived
+          ? `Failed to load ${requestedPath}: ${reason}${requestId ? ` (request ${requestId})` : ""}`
+          : `Could not reach MCP proxy at ${baseUrl} to load ${requestedPath}. Check that the proxy is running and its address is correct. ${reason}`;
+        console.error("[mcp-config] Configuration load failed", {
+          requestedPath,
+          proxyAddress: redactUrlForLog(baseUrl),
+          requestId,
+          responseReceived,
+          elapsedMs: Date.now() - startedAt,
+          reason,
+        });
+        setConfigLoadError(description);
         if (configPath) {
           toast({
             title: "Error",
-            description: `Failed to load config: ${error instanceof Error ? error.message : String(error)}`,
+            description,
             variant: "destructive",
           });
         }
@@ -702,11 +734,6 @@ const Sidebar = ({
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    setActiveConfigPath("~/.cursor/mcp.json");
-                    localStorage.setItem(
-                      "activeConfigPath",
-                      "~/.cursor/mcp.json",
-                    );
                     loadDefaultConfig("~/.cursor/mcp.json");
                   }}
                   disabled={isLoadingDefault}
@@ -726,13 +753,6 @@ const Sidebar = ({
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    setActiveConfigPath(
-                      "~/.gemini/antigravity/mcp_config.json",
-                    );
-                    localStorage.setItem(
-                      "activeConfigPath",
-                      "~/.gemini/antigravity/mcp_config.json",
-                    );
                     loadDefaultConfig("~/.gemini/antigravity/mcp_config.json");
                   }}
                   disabled={isLoadingDefault}
@@ -756,8 +776,6 @@ const Sidebar = ({
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    setActiveConfigPath("~/.claude.json");
-                    localStorage.setItem("activeConfigPath", "~/.claude.json");
                     loadDefaultConfig("~/.claude.json");
                   }}
                   disabled={isLoadingDefault}
@@ -777,11 +795,6 @@ const Sidebar = ({
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    setActiveConfigPath("~/.codex/config.toml");
-                    localStorage.setItem(
-                      "activeConfigPath",
-                      "~/.codex/config.toml",
-                    );
                     loadDefaultConfig("~/.codex/config.toml");
                   }}
                   disabled={isLoadingDefault}
@@ -801,11 +814,6 @@ const Sidebar = ({
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    setActiveConfigPath("~/.config/opencode/opencode.json");
-                    localStorage.setItem(
-                      "activeConfigPath",
-                      "~/.config/opencode/opencode.json",
-                    );
                     loadDefaultConfig("~/.config/opencode/opencode.json");
                   }}
                   disabled={isLoadingDefault}
@@ -847,8 +855,6 @@ const Sidebar = ({
                             data.path,
                             data.absolutePath,
                           );
-                          setActiveConfigPath(data.path);
-                          localStorage.setItem("activeConfigPath", data.path);
                           loadDefaultConfig(data.path);
                         }
                       }
@@ -902,6 +908,21 @@ const Sidebar = ({
                   <FileText className="w-3 h-3 shrink-0" />
                   <span className="truncate">{_configFilePath}</span>
                 </button>
+              )}
+              {configLoadError && (
+                <div role="alert" className="space-y-2">
+                  <p className="text-xs text-destructive break-words">
+                    {configLoadError}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={isLoadingDefault}
+                    onClick={() => loadDefaultConfig(activeConfigPath)}
+                  >
+                    Retry loading configuration
+                  </Button>
+                </div>
               )}
             </div>
 

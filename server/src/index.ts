@@ -292,9 +292,55 @@ const updateHeadersInPlace = (
 };
 
 const app = express();
+// Trace config requests before CORS/auth so preflight and rejected requests are logged.
+app.use((req, res, next) => {
+  if (req.path !== "/mcp-config" && req.path !== "/update-mcp-config") {
+    next();
+    return;
+  }
+
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  res.locals.configRequestId = requestId;
+  res.setHeader("X-MCP-Config-Request-Id", requestId);
+  logger.info("[mcp-config:http] Request received", {
+    requestId,
+    method: req.method,
+    route: req.path,
+    requestedPath: typeof req.query.path === "string" ? req.query.path : null,
+    origin: req.headers.origin ?? null,
+    host: req.headers.host,
+    remoteAddress: req.socket.remoteAddress,
+    hasAuthHeader: Boolean(req.headers["x-mcp-proxy-auth"]),
+    requestedHeaders: req.headers["access-control-request-headers"],
+  });
+  res.once("finish", () => {
+    logger.info("[mcp-config:http] Response finished", {
+      requestId,
+      status: res.statusCode,
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
+  res.once("close", () => {
+    if (!res.writableFinished) {
+      logger.warn(
+        "[mcp-config:http] Connection closed before response finished",
+        {
+          requestId,
+          status: res.statusCode,
+          elapsedMs: Date.now() - startedAt,
+        },
+      );
+    }
+  });
+  next();
+});
 app.use(cors());
 app.use((req, res, next) => {
-  res.header("Access-Control-Expose-Headers", "mcp-session-id");
+  res.header(
+    "Access-Control-Expose-Headers",
+    "mcp-session-id, X-MCP-Config-Request-Id",
+  );
   next();
 });
 
@@ -433,6 +479,11 @@ const authMiddleware = (
   }
 
   const sendUnauthorized = () => {
+    if (res.locals.configRequestId) {
+      logger.warn("[mcp-config:http] Authentication rejected", {
+        requestId: res.locals.configRequestId,
+      });
+    }
     res.status(401).json({
       error: "Unauthorized",
       message:
@@ -1636,17 +1687,34 @@ app.get(
   originValidationMiddleware,
   authMiddleware,
   async (req, res) => {
+    const requestId = res.locals.configRequestId as string;
+    let targetPath: string | undefined;
     try {
       // Allow overriding the path via query param for flexibility/testing
-      const rawOverridePath = (req.query.path as string) || "";
-      const overridePath = expandTildePath(rawOverridePath);
+      const rawOverridePath =
+        typeof req.query.path === "string" ? req.query.path : "";
       const defaultPath = path.join(os.homedir(), ".cursor", "mcp.json");
-      const targetPath = overridePath || defaultPath;
+      targetPath = rawOverridePath
+        ? expandTildePath(rawOverridePath)
+        : defaultPath;
+      logger.info("[mcp-config] Reading configuration", {
+        requestId,
+        requestedPath: rawOverridePath || "<default>",
+        resolvedPath: targetPath,
+        homeDirectory: os.homedir(),
+        workingDirectory: process.cwd(),
+      });
 
       try {
         const fileContent = await fs.readFile(targetPath, "utf8");
         const isToml = targetPath.endsWith(".toml");
         const isJsonc = targetPath.endsWith(".jsonc");
+        logger.info("[mcp-config] Configuration file read", {
+          requestId,
+          resolvedPath: targetPath,
+          bytes: Buffer.byteLength(fileContent, "utf8"),
+          format: isToml ? "toml" : isJsonc ? "jsonc" : "json",
+        });
         let parsed: unknown;
         try {
           if (isToml) {
@@ -1660,10 +1728,28 @@ app.get(
               : fileContent;
             parsed = JSON.parse(cleanedContent);
           }
-        } catch (e) {
+        } catch (error) {
+          // Parser messages can contain config values; keep them out of logs.
+          logger.warn("[mcp-config] Configuration parsing failed", {
+            requestId,
+            resolvedPath: targetPath,
+            errorType: error instanceof Error ? error.name : "Unknown",
+          });
           res.status(400).json({
             error: "Bad Request",
             message: `Invalid ${isToml ? "TOML" : "JSON"} in MCP configuration file at ${targetPath}`,
+          });
+          return;
+        }
+
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          logger.warn("[mcp-config] Configuration root is not an object", {
+            requestId,
+            resolvedPath: targetPath,
+          });
+          res.status(400).json({
+            error: "Bad Request",
+            message: `MCP configuration file at ${targetPath} must contain an object`,
           });
           return;
         }
@@ -1704,6 +1790,12 @@ app.get(
           | undefined;
 
         const serverCount = servers ? Object.keys(servers).length : 0;
+        logger.info("[mcp-config] Configuration loaded", {
+          requestId,
+          resolvedPath: targetPath,
+          serverCount,
+          serverKey: obj["servers"] ? "servers" : "mcpServers",
+        });
 
         res.json({
           path: targetPath,
@@ -1712,6 +1804,10 @@ app.get(
         });
       } catch (readErr: any) {
         if (readErr?.code === "ENOENT") {
+          logger.warn("[mcp-config] Configuration file not found", {
+            requestId,
+            resolvedPath: targetPath,
+          });
           if (isClaudeConfigPath(targetPath)) {
             try {
               const defaultConfig = { mcpServers: {} };
@@ -1720,9 +1816,11 @@ app.get(
                 JSON.stringify(defaultConfig, null, 2),
                 "utf8",
               );
-              console.log(
-                `[mcp-config] Auto-created Claude config at ${targetPath}`,
-              );
+              logger.info("[mcp-config] Auto-created Claude configuration", {
+                requestId,
+                resolvedPath: targetPath,
+                serverCount: 0,
+              });
               res.json({
                 path: targetPath,
                 config: defaultConfig,
@@ -1730,9 +1828,16 @@ app.get(
               });
               return;
             } catch (createErr) {
-              console.error(
+              logger.error(
                 "[mcp-config] Failed to auto-create Claude config:",
-                createErr,
+                {
+                  requestId,
+                  resolvedPath: targetPath,
+                  message:
+                    createErr instanceof Error
+                      ? createErr.message
+                      : String(createErr),
+                },
               );
             }
           }
@@ -1751,9 +1856,11 @@ app.get(
                 JSON.stringify(defaultConfig, null, 2),
                 "utf8",
               );
-              console.log(
-                `[mcp-config] Auto-created OpenCode config at ${targetPath}`,
-              );
+              logger.info("[mcp-config] Auto-created OpenCode configuration", {
+                requestId,
+                resolvedPath: targetPath,
+                serverCount: 0,
+              });
               res.json({
                 path: targetPath,
                 config: { ...defaultConfig, mcpServers: {} },
@@ -1761,9 +1868,16 @@ app.get(
               });
               return;
             } catch (createErr) {
-              console.error(
+              logger.error(
                 "[mcp-config] Failed to auto-create OpenCode config:",
-                createErr,
+                {
+                  requestId,
+                  resolvedPath: targetPath,
+                  message:
+                    createErr instanceof Error
+                      ? createErr.message
+                      : String(createErr),
+                },
               );
             }
           }
@@ -1773,14 +1887,24 @@ app.get(
           });
           return;
         }
-        console.error("Error reading MCP config:", readErr);
+        logger.error("[mcp-config] Failed to read configuration", {
+          requestId,
+          resolvedPath: targetPath,
+          code: readErr?.code,
+          message: readErr?.message || String(readErr),
+        });
         res.status(500).json({
           error: "Internal Server Error",
           message: readErr?.message || String(readErr),
         });
       }
     } catch (error: any) {
-      console.error("Unhandled error in /mcp-config route:", error);
+      logger.error("[mcp-config] Unhandled configuration error", {
+        requestId,
+        resolvedPath: targetPath,
+        code: error?.code,
+        message: error?.message || String(error),
+      });
       res.status(500).json({
         error: "Internal Server Error",
         message: error?.message || String(error),
@@ -1976,18 +2100,15 @@ app.post(
   authMiddleware,
   express.json(),
   async (req, res) => {
+    const requestId = res.locals.configRequestId as string;
+    let targetPath: string | undefined;
     try {
       const { servers } = req.body;
 
-      console.log("[update-mcp-config] Received request");
-      console.log("[update-mcp-config] req.query.path:", req.query.path);
-      console.log(
-        "[update-mcp-config] servers keys:",
-        servers ? Object.keys(servers) : "null/undefined",
-      );
-
-      if (!servers || typeof servers !== "object") {
-        console.error("[update-mcp-config] Invalid servers configuration");
+      if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+        logger.warn("[update-mcp-config] Invalid servers configuration", {
+          requestId,
+        });
         res.status(400).json({
           error: "Bad Request",
           message: "Invalid servers configuration provided",
@@ -1996,19 +2117,23 @@ app.post(
       }
 
       // Allow overriding the path via query param for flexibility/testing
-      const rawOverridePath = (req.query.path as string) || "";
-      const overridePath = expandTildePath(rawOverridePath);
+      const rawOverridePath =
+        typeof req.query.path === "string" ? req.query.path : "";
       const defaultPath = path.join(os.homedir(), ".cursor", "mcp.json");
-      const targetPath = overridePath || defaultPath;
-
-      console.log("[update-mcp-config] rawOverridePath:", rawOverridePath);
-      console.log("[update-mcp-config] overridePath:", overridePath);
-      console.log("[update-mcp-config] targetPath:", targetPath);
+      targetPath = rawOverridePath
+        ? expandTildePath(rawOverridePath)
+        : defaultPath;
 
       // Create the updated configuration
       const isToml = targetPath.endsWith(".toml");
 
-      console.log("[update-mcp-config] Writing to:", targetPath);
+      logger.info("[update-mcp-config] Writing configuration", {
+        requestId,
+        requestedPath: rawOverridePath || "<default>",
+        resolvedPath: targetPath,
+        serverCount: Object.keys(servers).length,
+        format: isToml ? "toml" : "json",
+      });
 
       if (isToml) {
         // For TOML files (Codex), read existing config to preserve non-MCP settings
@@ -2054,7 +2179,6 @@ app.post(
         }
 
         const tomlContent = TOML.stringify(existingConfig as any);
-        console.log("[update-mcp-config] TOML Config:", tomlContent);
         await fs.writeFile(targetPath, tomlContent, "utf8");
       } else {
         // OpenCode uses "mcp" key; detect by reading existing file or path pattern
@@ -2132,10 +2256,6 @@ app.post(
           updatedConfig = { mcpServers: servers };
         }
 
-        console.log(
-          "[update-mcp-config] Config:",
-          JSON.stringify(updatedConfig, null, 2),
-        );
         // Write the updated configuration to file
         await fs.writeFile(
           targetPath,
@@ -2144,7 +2264,11 @@ app.post(
         );
       }
 
-      console.log("[update-mcp-config] Write successful");
+      logger.info("[update-mcp-config] Configuration saved", {
+        requestId,
+        resolvedPath: targetPath,
+        serverCount: Object.keys(servers).length,
+      });
 
       res.json({
         success: true,
@@ -2153,7 +2277,12 @@ app.post(
         serverCount: Object.keys(servers).length,
       });
     } catch (error: any) {
-      console.error("[update-mcp-config] Error:", error);
+      logger.error("[update-mcp-config] Failed to save configuration", {
+        requestId,
+        resolvedPath: targetPath,
+        code: error?.code,
+        errorType: error instanceof Error ? error.name : "Unknown",
+      });
       res.status(500).json({
         error: "Internal Server Error",
         message: error?.message || String(error),
@@ -5940,25 +6069,67 @@ app.post(
     }
   },
 );
-const server = app.listen(PORT, HOST);
-server.on("listening", () => {
-  logger.info(`⚙️ Proxy server listening on ${HOST}:${PORT}`);
-  if (!authDisabled) {
-    logger.info(
-      `🔑 Session token: ${sessionToken}\n   ` +
-        `Use this token to authenticate requests or set DANGEROUSLY_OMIT_AUTH=true to disable auth`,
-    );
-  } else {
-    logger.warn(
-      `⚠️  WARNING: Authentication is disabled. This is not recommended.`,
-    );
-  }
-});
-server.on("error", (err) => {
-  if (err.message.includes(`EADDRINUSE`)) {
-    logger.error(`❌  Proxy Server PORT IS IN USE at port ${PORT} ❌ `);
-  } else {
-    logger.error(err.message);
-  }
-  process.exit(1);
-});
+// Resolving "localhost" in listen() selects only one address family. Listen on
+// both loopback addresses so clients using 127.0.0.1 or ::1 reach the same app.
+const listenHosts = HOST === "localhost" ? ["127.0.0.1", "::1"] : [HOST];
+for (const listenHost of listenHosts) {
+  const server = http.createServer(app);
+  server.on("listening", () => {
+    const displayHost = listenHost.includes(":")
+      ? `[${listenHost}]`
+      : listenHost;
+    logger.info(`⚙️ Proxy server listening on http://${displayHost}:${PORT}`);
+    logger.info("[mcp-config] Proxy runtime", {
+      processId: process.pid,
+      nodeVersion: process.version,
+      platform: process.platform,
+      configuredHost: HOST,
+      listenAddress: server.address(),
+      homeDirectory: os.homedir(),
+      workingDirectory: process.cwd(),
+      logFile: logger.getLogFilePath(),
+      authenticationEnabled: !authDisabled,
+    });
+    if (listenHost === listenHosts[0]) {
+      if (!authDisabled) {
+        logger.info(
+          `🔑 Session token: ${sessionToken}\n   ` +
+            `Use this token to authenticate requests or set DANGEROUSLY_OMIT_AUTH=true to disable auth`,
+        );
+      } else {
+        logger.warn(
+          `⚠️  WARNING: Authentication is disabled. This is not recommended.`,
+        );
+      }
+    }
+  });
+  server.on("error", (error: NodeJS.ErrnoException) => {
+    // IPv4 remains usable on machines where IPv6 loopback is unavailable.
+    if (
+      HOST === "localhost" &&
+      listenHost === "::1" &&
+      ["EAFNOSUPPORT", "EADDRNOTAVAIL", "EPROTONOSUPPORT"].includes(
+        error.code || "",
+      )
+    ) {
+      logger.warn("[proxy:listen] IPv6 loopback unavailable; using IPv4", {
+        host: listenHost,
+        port: PORT,
+        code: error.code,
+      });
+      return;
+    }
+    logger.error("[proxy:listen] Failed to listen", {
+      host: listenHost,
+      port: PORT,
+      code: error.code,
+      message: error.message,
+    });
+    process.exit(1);
+  });
+  server.listen({
+    port: PORT,
+    host: listenHost,
+    ipv6Only: listenHost === "::1",
+  });
+}
