@@ -1496,14 +1496,14 @@ const MCPStoreTab = ({
   };
 
   return (
-    <div className="w-full p-4">
+    <div className="w-full p-2 sm:p-4">
       <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
-        <div>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <Store className="w-6 h-6" />
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold flex flex-wrap items-center gap-2">
+            <Store className="w-6 h-6 shrink-0" />
             MCP store
             {currentSource && (
-              <span className="flex items-center gap-1 font-normal text-lg">
+              <span className="flex items-center gap-1 font-normal text-base sm:text-lg">
                 (
                 <button
                   onClick={async () => {
@@ -1538,17 +1538,17 @@ const MCPStoreTab = ({
               </span>
             )}
           </h1>
-          <p className="text-muted-foreground">
+          <p className="text-sm sm:text-base text-muted-foreground">
             Discover and install MCP servers from various sources
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             onClick={() => setShowSourceConfig(true)}
             className="flex items-center gap-2"
           >
-            <Settings className="w-4 h-4" />
+            <Settings className="w-4 h-4 shrink-0" />
             Configure Sources
           </Button>
           <Button
@@ -1558,9 +1558,9 @@ const MCPStoreTab = ({
             className="flex items-center gap-2"
           >
             {isLoading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <Loader2 className="w-4 h-4 shrink-0 animate-spin" />
             ) : (
-              <RefreshCw className="w-4 h-4" />
+              <RefreshCw className="w-4 h-4 shrink-0" />
             )}
             Refresh
           </Button>

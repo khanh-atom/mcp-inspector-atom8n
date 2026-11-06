@@ -38,7 +38,8 @@ import {
 } from "./lib/hooks/useDraggablePane";
 import { useToast } from "./lib/hooks/useToast";
 
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
+import { OverflowTabsList } from "@/components/ui/overflow-tabs-list";
 import {
   Bell,
   ChevronLeft,
@@ -231,7 +232,10 @@ const App = () => {
   const [currentServers, setCurrentServers] = useState<Record<string, any>>({});
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     const saved = localStorage.getItem("sidebarCollapsed");
-    return saved === "true";
+    if (saved !== null) {
+      return saved === "true";
+    }
+    return typeof window !== "undefined" && window.innerWidth < 768;
   });
   const [activeConfigPath, setActiveConfigPath] = useState(
     () => localStorage.getItem("activeConfigPath") || "",
@@ -1423,6 +1427,17 @@ const App = () => {
     setLogLevel(level);
   };
 
+  const handleTabChange = (value: string) => {
+    setActiveTab(value);
+    window.location.hash = value;
+  };
+
+  // Tabs available while disconnected; fall back to the store if the
+  // current tab only exists when connected.
+  const disconnectedTab = ["store", "credentials", "logger"].includes(activeTab)
+    ? activeTab
+    : "store";
+
   const AuthDebuggerWrapper = () => (
     <TabsContent value="auth">
       <AuthDebugger
@@ -1665,82 +1680,61 @@ const App = () => {
             </>
           )}
         </div>
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-hidden min-w-0">
           <div className="flex-1 overflow-auto">
             {mcpClient ? (
               <Tabs
                 value={activeTab}
-                className="w-full p-4"
-                onValueChange={(value) => {
-                  setActiveTab(value);
-                  window.location.hash = value;
-                }}
+                className="w-full p-2 sm:p-4"
+                onValueChange={handleTabChange}
               >
-                <TabsList className="mb-4 py-0">
-                  <TabsTrigger value="store">
-                    <Store className="w-4 h-4 mr-2" />
-                    MCP Store
-                  </TabsTrigger>
-                  <TabsTrigger value="credentials">
-                    <Shield className="w-4 h-4 mr-2" />
-                    Credentials
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="resources"
-                    disabled={!serverCapabilities?.resources}
-                  >
-                    <Files className="w-4 h-4 mr-2" />
-                    Resources
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="prompts"
-                    disabled={!serverCapabilities?.prompts}
-                  >
-                    <MessageSquare className="w-4 h-4 mr-2" />
-                    Prompts
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="tools"
-                    disabled={!serverCapabilities?.tools}
-                  >
-                    <Hammer className="w-4 h-4 mr-2" />
-                    Tools
-                  </TabsTrigger>
-                  <TabsTrigger value="ping">
-                    <Bell className="w-4 h-4 mr-2" />
-                    Ping
-                  </TabsTrigger>
-                  <TabsTrigger value="sampling" className="relative">
-                    <Hash className="w-4 h-4 mr-2" />
-                    Sampling
-                    {pendingSampleRequests.length > 0 && (
-                      <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-4 w-4 flex items-center justify-center">
-                        {pendingSampleRequests.length}
-                      </span>
-                    )}
-                  </TabsTrigger>
-                  <TabsTrigger value="elicitations" className="relative">
-                    <MessageSquare className="w-4 h-4 mr-2" />
-                    Elicitations
-                    {pendingElicitationRequests.length > 0 && (
-                      <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-4 w-4 flex items-center justify-center">
-                        {pendingElicitationRequests.length}
-                      </span>
-                    )}
-                  </TabsTrigger>
-                  <TabsTrigger value="roots">
-                    <FolderTree className="w-4 h-4 mr-2" />
-                    Roots
-                  </TabsTrigger>
-                  <TabsTrigger value="auth">
-                    <Key className="w-4 h-4 mr-2" />
-                    Auth
-                  </TabsTrigger>
-                  <TabsTrigger value="logger">
-                    <FileText className="w-4 h-4 mr-2" />
-                    Logger
-                  </TabsTrigger>
-                </TabsList>
+                <OverflowTabsList
+                  className="mb-4"
+                  activeValue={activeTab}
+                  onSelect={handleTabChange}
+                  items={[
+                    { value: "store", label: "MCP Store", icon: Store },
+                    {
+                      value: "credentials",
+                      label: "Credentials",
+                      icon: Shield,
+                    },
+                    {
+                      value: "resources",
+                      label: "Resources",
+                      icon: Files,
+                      disabled: !serverCapabilities?.resources,
+                    },
+                    {
+                      value: "prompts",
+                      label: "Prompts",
+                      icon: MessageSquare,
+                      disabled: !serverCapabilities?.prompts,
+                    },
+                    {
+                      value: "tools",
+                      label: "Tools",
+                      icon: Hammer,
+                      disabled: !serverCapabilities?.tools,
+                    },
+                    { value: "ping", label: "Ping", icon: Bell },
+                    {
+                      value: "sampling",
+                      label: "Sampling",
+                      icon: Hash,
+                      badge: pendingSampleRequests.length,
+                    },
+                    {
+                      value: "elicitations",
+                      label: "Elicitations",
+                      icon: MessageSquare,
+                      badge: pendingElicitationRequests.length,
+                    },
+                    { value: "roots", label: "Roots", icon: FolderTree },
+                    { value: "auth", label: "Auth", icon: Key },
+                    { value: "logger", label: "Logger", icon: FileText },
+                  ]}
+                />
 
                 <div className="w-full">
                   {!serverCapabilities?.resources &&
@@ -1946,24 +1940,24 @@ const App = () => {
               </Tabs>
             ) : (
               <Tabs
-                defaultValue={"store"}
-                className="w-full p-4"
-                onValueChange={(value) => (window.location.hash = value)}
+                value={disconnectedTab}
+                className="w-full p-2 sm:p-4"
+                onValueChange={handleTabChange}
               >
-                <TabsList className="mb-4 py-0">
-                  <TabsTrigger value="store">
-                    <Store className="w-4 h-4 mr-2" />
-                    MCP Store
-                  </TabsTrigger>
-                  <TabsTrigger value="credentials">
-                    <Shield className="w-4 h-4 mr-2" />
-                    Credentials
-                  </TabsTrigger>
-                  <TabsTrigger value="logger">
-                    <FileText className="w-4 h-4 mr-2" />
-                    Logger
-                  </TabsTrigger>
-                </TabsList>
+                <OverflowTabsList
+                  className="mb-4"
+                  activeValue={disconnectedTab}
+                  onSelect={handleTabChange}
+                  items={[
+                    { value: "store", label: "MCP Store", icon: Store },
+                    {
+                      value: "credentials",
+                      label: "Credentials",
+                      icon: Shield,
+                    },
+                    { value: "logger", label: "Logger", icon: FileText },
+                  ]}
+                />
                 <TabsContent value="credentials">
                   <CredentialsTab
                     config={config}

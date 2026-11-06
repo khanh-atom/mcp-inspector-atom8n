@@ -1934,15 +1934,15 @@ const CredentialsTab = ({
     <TabsContent value="credentials">
       <div className="space-y-4">
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <Shield className="w-5 h-5" />
+            <Shield className="w-5 h-5 shrink-0" />
             <h2 className="text-lg font-semibold">Credentials</h2>
             {entries.length > 0 && (
               <Badge variant="secondary">{entries.length}</Badge>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               variant="default"
               size="sm"

@@ -245,18 +245,18 @@ const LoggerTab = ({ config }: { config: InspectorConfig }) => {
   }, [selectedFile, fetchLogContent, pageSize]);
 
   return (
-    <div className="w-full p-4">
-      <div className="flex items-center justify-between mb-6">
+    <div className="w-full p-2 sm:p-4">
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
         <div>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <FileText className="w-6 h-6" />
+          <h1 className="text-xl sm:text-2xl font-bold flex items-center gap-2">
+            <FileText className="w-6 h-6 shrink-0" />
             Server Logs
           </h1>
-          <p className="text-muted-foreground">
+          <p className="text-sm sm:text-base text-muted-foreground">
             View and manage server log files
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             onClick={() => setShowTestDialog(true)}
