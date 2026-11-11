@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { InspectorConfig } from "@/lib/configurationTypes";
+import { CustomHeaders, headersToRecord } from "@/lib/types/customHeaders";
 import {
   getMCPProxyAddress,
   getMCPProxyAuthToken,
@@ -58,6 +59,9 @@ import {
 // Type guard to safely detect the optional _meta field without using `any`
 const hasMeta = (tool: Tool): tool is Tool & { _meta: unknown } =>
   typeof (tool as { _meta?: unknown })._meta !== "undefined";
+
+const quoteShellArg = (value: string): string =>
+  `'${value.replace(/'/g, "'\\''")}'`;
 
 const normalizeCredentialUrl = (value: unknown): string | null => {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -87,6 +91,7 @@ const ToolsTab = ({
   currentServerConfig,
   loadedServers,
   config,
+  customHeaders = [],
   credentialsFolderPath,
   rawCredentials,
 }: {
@@ -107,6 +112,7 @@ const ToolsTab = ({
   currentServerConfig?: Record<string, unknown>;
   loadedServers?: Record<string, Record<string, unknown>>;
   config?: InspectorConfig;
+  customHeaders?: CustomHeaders;
   credentialsFolderPath?: string;
   rawCredentials?: RawCredentials | null;
 }) => {
@@ -387,12 +393,24 @@ const ToolsTab = ({
         credentialMeta: requestBody.credentialMeta,
       });
 
+      const requestHeaders = headersToRecord(customHeaders);
+      const customHeaderNames = Object.keys(requestHeaders).filter(
+        (name) => name.toLowerCase() !== "authorization",
+      );
+      if (customHeaderNames.length > 0) {
+        requestHeaders["x-custom-auth-headers"] =
+          JSON.stringify(customHeaderNames);
+      }
+      const headerOptions = Object.entries(requestHeaders).map(
+        ([name, value]) => `  -H ${quoteShellArg(`${name}: ${value}`)} \\`,
+      );
+
       return `curl -X POST ${proxyUrl}/execute-tool \\
   -H "Origin: http://localhost:6274" \\
   -H "Content-Type: application/json" \\
-  -d '${JSON.stringify(requestBody, null, 2)}'`;
+${headerOptions.length > 0 ? `${headerOptions.join("\n")}\n` : ""}  -d ${quoteShellArg(JSON.stringify(requestBody, null, 2))}`;
     },
-    [currentServerConfig, credentialsFolderPath, rawCredentials],
+    [currentServerConfig, credentialsFolderPath, rawCredentials, customHeaders],
   );
 
   const generateCurlCommand = () => {

@@ -1,4 +1,5 @@
 import { InspectorConfig } from "@/lib/configurationTypes";
+import { CustomHeaders } from "@/lib/types/customHeaders";
 import {
   DEFAULT_MCP_PROXY_LISTEN_PORT,
   DEFAULT_INSPECTOR_CONFIG,
@@ -85,6 +86,44 @@ export const getServerConfigUrl = (serverConfig: unknown): string => {
     source
   ];
   return typeof value === "string" ? value : "";
+};
+
+export const getServerConfigTransportType = (
+  serverConfig: unknown,
+): "stdio" | "sse" | "streamable-http" | null => {
+  if (!serverConfig || typeof serverConfig !== "object") {
+    return null;
+  }
+
+  const config = serverConfig as { command?: unknown; type?: unknown };
+  if (config.command) {
+    return "stdio";
+  }
+  // Claude uses "http" for the Streamable HTTP transport.
+  if (config.type === "http" || config.type === "streamable-http") {
+    return "streamable-http";
+  }
+  if (config.type === "sse" || getServerConfigUrl(serverConfig)) {
+    return "sse";
+  }
+  return null;
+};
+
+export const getServerConfigHeaders = (
+  serverConfig: unknown,
+): CustomHeaders => {
+  if (!serverConfig || typeof serverConfig !== "object") {
+    return [];
+  }
+
+  const { headers } = serverConfig as { headers?: unknown };
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return [];
+  }
+
+  return Object.entries(headers).flatMap(([name, value]) =>
+    typeof value === "string" ? [{ name, value, enabled: true }] : [],
+  );
 };
 
 export const redactUrlForLog = (rawUrl: string): string => {

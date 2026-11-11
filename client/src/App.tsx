@@ -94,6 +94,8 @@ import {
   saveInspectorConfig,
   getServerConfigUrl,
   getServerConfigUrlSource,
+  getServerConfigTransportType,
+  getServerConfigHeaders,
   redactUrlForLog,
 } from "./utils/configUtils";
 import ElicitationTab, {
@@ -246,6 +248,12 @@ const App = () => {
     localStorage.setItem("sidebarCollapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
   const [configRefreshKey, setConfigRefreshKey] = useState(0);
+  const [isReloadingConnectionConfig, setIsReloadingConnectionConfig] =
+    useState(false);
+  const [connectionConfigError, setConnectionConfigError] = useState<
+    string | null
+  >(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   // [CREDENTIALS] State for credential management
   const [credentialsFolderPath, setCredentialsFolderPath] = useState<string>(
     () => localStorage.getItem("credentialsFolderPath") || "./data",
@@ -288,17 +296,16 @@ const App = () => {
           const names = Object.keys(servers);
           if (names.length > 0) {
             const first = servers[names[0]];
+            setCustomHeaders(getServerConfigHeaders(first));
             if (first.command) {
               setTransportType("stdio");
               setCommand(first.command);
               setArgs(first.args ? first.args.join(" ") : "");
-              if (first.env) setEnv(first.env);
+              setEnv(first.env || {});
             } else {
               const firstUrl = getServerConfigUrl(first);
               if (firstUrl) {
-                setTransportType(
-                  first.type === "streamable-http" ? "streamable-http" : "sse",
-                );
+                setTransportType(getServerConfigTransportType(first) || "sse");
                 setSseUrl(firstUrl);
                 console.log(
                   "[App] Applied first URL server while sidebar collapsed:",
@@ -324,15 +331,17 @@ const App = () => {
   }, [configRefreshKey, sidebarCollapsed]);
 
   // Reload config file from disk and reconnect with updated values
-  const reloadConfigAndReconnect = async () => {
+  const reloadConfigAndReconnect = async (selectedServerName?: string) => {
+    setConnectionConfigError(null);
     const path = configFilePath || localStorage.getItem("activeConfigPath");
     if (!path) {
       console.warn(
         "[App] No config path to reload, reconnecting with current values",
       );
-      connectMcpServer();
+      await connectMcpServer();
       return;
     }
+    setIsReloadingConnectionConfig(true);
     try {
       console.log(`[App] Reloading config from: ${path}`);
       const baseUrl = getMCPProxyAddress(config);
@@ -345,9 +354,9 @@ const App = () => {
         },
       });
       if (!resp.ok) {
-        console.error(`[App] Config fetch failed: ${resp.status}`);
-        connectMcpServer();
-        return;
+        throw new Error(
+          `Could not reload MCP configuration (HTTP ${resp.status}).`,
+        );
       }
       const data = await resp.json();
       const configData = data.config as any;
@@ -355,23 +364,45 @@ const App = () => {
         | Record<string, any>
         | undefined;
       if (servers) {
-        // Find the currently-selected server by matching command
         const serverName =
+          selectedServerName ||
           Object.keys(servers).find((name) => {
             const s = servers[name];
             if (transportType === "stdio") {
               return s.command === command;
             }
             return getServerConfigUrl(s) === sseUrl;
-          }) || Object.keys(servers)[0];
+          }) ||
+          Object.keys(servers)[0];
         const serverConfig = servers[serverName];
-        if (serverConfig?.command) {
+        const refreshedTransportType =
+          getServerConfigTransportType(serverConfig);
+        if (!refreshedTransportType) {
+          throw new Error(
+            `Server "${serverName}" has no usable connection configuration.`,
+          );
+        }
+        const refreshedHeaders = getServerConfigHeaders(serverConfig);
+        setTransportType(refreshedTransportType);
+        setCustomHeaders(refreshedHeaders);
+        if (refreshedTransportType === "stdio") {
           console.log(
             `[App] Applying refreshed config for "${serverName}": command=${serverConfig.command}, args=${JSON.stringify(serverConfig.args)}`,
           );
           setCommand(serverConfig.command);
-          setArgs(serverConfig.args ? serverConfig.args.join(" ") : "");
-          if (serverConfig.env) setEnv(serverConfig.env);
+          const refreshedArgs = serverConfig.args
+            ? serverConfig.args.join(" ")
+            : "";
+          const refreshedEnv = serverConfig.env || {};
+          setArgs(refreshedArgs);
+          setEnv(refreshedEnv);
+          setPendingConnection({
+            transportType: refreshedTransportType,
+            command: serverConfig.command,
+            args: refreshedArgs,
+            env: refreshedEnv,
+            customHeaders: refreshedHeaders,
+          });
         } else {
           const refreshedUrl = getServerConfigUrl(serverConfig);
           if (refreshedUrl) {
@@ -383,28 +414,26 @@ const App = () => {
                 serverUrl: redactUrlForLog(refreshedUrl),
               },
             );
-            setTransportType(
-              serverConfig.type === "streamable-http"
-                ? "streamable-http"
-                : "sse",
-            );
             setSseUrl(refreshedUrl);
+            setPendingConnection({
+              transportType: refreshedTransportType,
+              sseUrl: refreshedUrl,
+              customHeaders: refreshedHeaders,
+            });
+          } else {
+            throw new Error(`Server "${serverName}" is missing its URL.`);
           }
         }
+      } else {
+        throw new Error("The configuration file contains no MCP servers.");
       }
       // Also refresh sidebar
       setConfigRefreshKey((k) => k + 1);
-      // Wait for React re-render with new state, then connect using ref
-      console.log(
-        "[App] State updated, waiting for React re-render before connecting...",
-      );
-      setTimeout(() => {
-        console.log("[App] Reconnecting after config reload (via ref)");
-        connectMcpServerRef.current();
-      }, 500);
     } catch (e) {
       console.error("[App] Error reloading config:", e);
-      connectMcpServer();
+      setConnectionConfigError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsReloadingConnectionConfig(false);
     }
   };
 
@@ -415,15 +444,18 @@ const App = () => {
     setAuthState((prev) => ({ ...prev, ...updates }));
   };
 
-  // Ref to track pending test connection config — triggers connect via useEffect
-  const pendingTestConnectRef = useRef<{
+  // Connect after React has applied the complete server configuration.
+  const [pendingConnection, setPendingConnection] = useState<{
     command?: string;
     args?: string;
     sseUrl?: string;
     transportType: "stdio" | "sse" | "streamable-http";
+    env?: Record<string, string>;
+    customHeaders?: CustomHeaders;
   } | null>(null);
 
   const handleTestConnection = async (serverConfig: any) => {
+    setConnectionConfigError(null);
     const configuredServerUrl = getServerConfigUrl(serverConfig);
     const configuredServerUrlSource = getServerConfigUrlSource(serverConfig);
     console.log("[App] handleTestConnection server config:", {
@@ -434,6 +466,20 @@ const App = () => {
       serverUrl: redactUrlForLog(configuredServerUrl),
     });
 
+    // Finish disconnecting before applying and connecting the next server.
+    try {
+      if (
+        connectionStatus === "connected" ||
+        connectionStatus === "connecting"
+      ) {
+        await disconnectMcpServer();
+      }
+    } catch (error) {
+      console.warn("[App] Could not close the previous connection:", error);
+    }
+
+    const configuredHeaders = getServerConfigHeaders(serverConfig);
+    setCustomHeaders(configuredHeaders);
     // Apply the server configuration for testing
     if (serverConfig.command) {
       const newCmd = serverConfig.command;
@@ -441,22 +487,21 @@ const App = () => {
       setTransportType("stdio");
       setCommand(newCmd);
       setArgs(newArgs);
-      if (serverConfig.env) {
-        setEnv(serverConfig.env);
-      }
-      pendingTestConnectRef.current = {
+      setEnv(serverConfig.env || {});
+      setPendingConnection({
         command: newCmd,
         args: newArgs,
         transportType: "stdio",
-      };
+        customHeaders: configuredHeaders,
+      });
     } else if (
       serverConfig.type === "streamable-http" ||
+      serverConfig.type === "http" ||
       serverConfig.type === "sse" ||
       configuredServerUrl
     ) {
       const newUrl = configuredServerUrl;
-      const newTransport =
-        serverConfig.type === "streamable-http" ? "streamable-http" : "sse";
+      const newTransport = getServerConfigTransportType(serverConfig) || "sse";
       console.log("[App] Applying URL server for test connection:", {
         transportType: newTransport,
         serverUrlSource: configuredServerUrlSource,
@@ -474,27 +519,15 @@ const App = () => {
           },
         ]);
       }
-      pendingTestConnectRef.current = {
+      setPendingConnection({
         sseUrl: newUrl,
         transportType: newTransport,
-      };
+      });
     }
 
     // Navigate to Tools tab for immediate feedback
     setActiveTab("tools");
     window.location.hash = "tools";
-
-    // If already connected or connecting, disconnect first
-    try {
-      if (
-        connectionStatus === "connected" ||
-        connectionStatus === "connecting"
-      ) {
-        await disconnectMcpServer();
-      }
-    } catch {
-      // ignore disconnect errors
-    }
 
     toast({
       title: "Connecting",
@@ -631,11 +664,11 @@ const App = () => {
         description: `Connecting to n8n fork server at ${N8N_FORK_SERVER_URL}...`,
       });
 
-      // Use pending test connect mechanism to connect after state update
-      pendingTestConnectRef.current = {
+      // Connect after the transport and URL state update.
+      setPendingConnection({
         sseUrl: forkUrl,
         transportType: "sse",
-      };
+      });
 
       console.log("[App:fork] Fork switch initiated successfully");
     } catch (error) {
@@ -714,6 +747,7 @@ const App = () => {
     oauthScope,
     config,
     connectionType,
+    onConnectionError: setConnectionError,
     onNotification: (notification) => {
       setNotifications((prev) => [...prev, notification as ServerNotification]);
       // Detect fatal process crash from proxy — show error dialog and disconnect
@@ -764,13 +798,9 @@ const App = () => {
     defaultLoggingLevel: logLevel,
   });
 
-  // Ref to always hold the latest connectMcpServer (avoids stale closure in setTimeout)
-  const connectMcpServerRef = useRef(connectMcpServer);
-  connectMcpServerRef.current = connectMcpServer;
-  // Effect: connect once React state matches the pending test connection config
   useEffect(() => {
-    const pending = pendingTestConnectRef.current;
-    if (!pending) return;
+    const pending = pendingConnection;
+    if (!pending || transportType !== pending.transportType) return;
 
     // Verify state has flushed to match the pending config
     if (pending.transportType === "stdio") {
@@ -778,11 +808,23 @@ const App = () => {
     } else {
       if (sseUrl !== pending.sseUrl) return;
     }
+    if (pending.env && env !== pending.env) return;
+    if (pending.customHeaders && customHeaders !== pending.customHeaders)
+      return;
 
     // State is in sync – clear flag and connect
-    pendingTestConnectRef.current = null;
+    setPendingConnection(null);
     void connectMcpServer();
-  }, [command, args, sseUrl, transportType, connectMcpServer]);
+  }, [
+    pendingConnection,
+    command,
+    args,
+    sseUrl,
+    transportType,
+    env,
+    customHeaders,
+    connectMcpServer,
+  ]);
 
   useEffect(() => {
     if (serverCapabilities) {
@@ -1627,7 +1669,14 @@ const App = () => {
           {!sidebarCollapsed && (
             <>
               <Sidebar
-                connectionStatus={connectionStatus}
+                connectionStatus={
+                  isReloadingConnectionConfig
+                    ? "connecting"
+                    : connectionConfigError
+                      ? "error"
+                      : connectionStatus
+                }
+                connectionError={connectionConfigError || connectionError}
                 transportType={transportType}
                 setTransportType={setTransportType}
                 command={command}
@@ -1650,7 +1699,14 @@ const App = () => {
                 setOauthClientSecret={setOauthClientSecret}
                 oauthScope={oauthScope}
                 setOauthScope={setOauthScope}
-                onConnect={reloadConfigAndReconnect}
+                onConnect={(serverName) => {
+                  setConnectionConfigError(null);
+                  if (serverName) {
+                    void reloadConfigAndReconnect(serverName);
+                  } else {
+                    void connectMcpServer();
+                  }
+                }}
                 onDisconnect={disconnectMcpServer}
                 logLevel={logLevel}
                 sendLogLevelRequest={sendLogLevelRequest}
@@ -1864,6 +1920,7 @@ const App = () => {
                           readResource(uri);
                         }}
                         currentServerConfig={serverConfigForCurl}
+                        customHeaders={customHeaders}
                         loadedServers={currentServers}
                         config={config}
                         credentialsFolderPath={credentialsFolderPath}

@@ -38,6 +38,8 @@ import {
   getMCPProxyAuthToken,
   getServerConfigUrl,
   getServerConfigUrlSource,
+  getServerConfigTransportType,
+  getServerConfigHeaders,
   redactUrlForLog,
 } from "@/utils/configUtils";
 import { ConnectionStatus } from "@/lib/constants";
@@ -58,6 +60,7 @@ import {
 
 interface SidebarProps {
   connectionStatus: ConnectionStatus;
+  connectionError?: string | null;
   transportType: "stdio" | "sse" | "streamable-http";
   setTransportType: (type: "stdio" | "sse" | "streamable-http") => void;
   command: string;
@@ -79,7 +82,7 @@ interface SidebarProps {
   setOauthClientSecret: (secret: string) => void;
   oauthScope: string;
   setOauthScope: (scope: string) => void;
-  onConnect: () => void;
+  onConnect: (serverName?: string) => void;
   onDisconnect: () => void;
   logLevel: LoggingLevel;
   sendLogLevelRequest: (level: LoggingLevel) => void;
@@ -94,6 +97,7 @@ interface SidebarProps {
 
 const Sidebar = ({
   connectionStatus,
+  connectionError,
   transportType,
   setTransportType,
   command,
@@ -146,6 +150,7 @@ const Sidebar = ({
     (serverConfig: any) => {
       const serverUrl = getServerConfigUrl(serverConfig);
       const serverUrlSource = getServerConfigUrlSource(serverConfig);
+      const serverTransportType = getServerConfigTransportType(serverConfig);
       console.log("Applying server configuration:", {
         type: serverConfig?.type,
         hasCommand: Boolean(serverConfig?.command),
@@ -154,7 +159,8 @@ const Sidebar = ({
         serverUrl: redactUrlForLog(serverUrl),
       });
 
-      if (serverConfig.command) {
+      setCustomHeaders(getServerConfigHeaders(serverConfig));
+      if (serverTransportType === "stdio") {
         console.log(
           "Detected STDIO server with command:",
           serverConfig.command,
@@ -162,11 +168,8 @@ const Sidebar = ({
         setTransportType("stdio");
         setCommand(serverConfig.command);
         setArgs(serverConfig.args ? serverConfig.args.join(" ") : "");
-        if (serverConfig.env) {
-          console.log("Setting environment variables:", serverConfig.env);
-          setEnv(serverConfig.env);
-        }
-      } else if (serverConfig.type === "streamable-http") {
+        setEnv(serverConfig.env || {});
+      } else if (serverTransportType === "streamable-http") {
         console.log(
           "Detected Streamable HTTP server with URL:",
           redactUrlForLog(serverUrl),
@@ -175,7 +178,7 @@ const Sidebar = ({
         );
         setTransportType("streamable-http");
         setSseUrl(serverUrl);
-      } else if (serverConfig.type === "sse" || serverUrl) {
+      } else if (serverTransportType === "sse") {
         console.log(
           "Detected SSE server with URL:",
           redactUrlForLog(serverUrl),
@@ -189,7 +192,14 @@ const Sidebar = ({
         console.warn("Server config does not match expected patterns");
       }
     },
-    [setTransportType, setCommand, setArgs, setEnv, setSseUrl],
+    [
+      setTransportType,
+      setCommand,
+      setArgs,
+      setEnv,
+      setSseUrl,
+      setCustomHeaders,
+    ],
   );
 
   // Handle server selection change
@@ -963,7 +973,7 @@ const Sidebar = ({
                   ) : (
                     <Button
                       className="w-full"
-                      onClick={onConnect}
+                      onClick={() => onConnect(selectedServer)}
                       disabled={
                         !selectedServer || connectionStatus === "connecting"
                       }
@@ -1414,8 +1424,8 @@ const Sidebar = ({
                 <div className="grid grid-cols-2 gap-4">
                   <Button
                     data-testid="connect-button"
-                    onClick={() => {
-                      onDisconnect();
+                    onClick={async () => {
+                      await onDisconnect();
                       onConnect();
                     }}
                   >
@@ -1429,52 +1439,21 @@ const Sidebar = ({
                 </div>
               )}
               {connectionStatus !== "connected" && (
-                <Button className="w-full" onClick={onConnect}>
-                  <Play className="w-4 h-4 mr-2" />
-                  Connect
+                <Button
+                  className="w-full"
+                  onClick={() => onConnect()}
+                  disabled={connectionStatus === "connecting"}
+                >
+                  {connectionStatus === "connecting" ? (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <Play className="w-4 h-4 mr-2" />
+                  )}
+                  {connectionStatus === "connecting"
+                    ? "Connecting..."
+                    : "Connect"}
                 </Button>
               )}
-
-              <div className="flex items-center justify-center space-x-2 mb-4">
-                <div
-                  className={`w-2 h-2 rounded-full ${(() => {
-                    switch (connectionStatus) {
-                      case "connected":
-                        return "bg-green-500";
-                      case "connecting":
-                        return "bg-yellow-500";
-                      case "error":
-                        return "bg-red-500";
-                      case "error-connecting-to-proxy":
-                        return "bg-red-500";
-                      default:
-                        return "bg-gray-500";
-                    }
-                  })()}`}
-                />
-                <span className="text-sm text-gray-600 dark:text-gray-400">
-                  {(() => {
-                    switch (connectionStatus) {
-                      case "connected":
-                        return "Connected";
-                      case "connecting":
-                        return "Connecting...";
-                      case "error": {
-                        const hasProxyToken =
-                          config.MCP_PROXY_AUTH_TOKEN?.value;
-                        if (!hasProxyToken) {
-                          return "Connection Error - Did you add the proxy session token in Configuration?";
-                        }
-                        return "Connection Error - Check if your MCP server is running and proxy token is correct";
-                      }
-                      case "error-connecting-to-proxy":
-                        return "Error Connecting to MCP Inspector Proxy - Check Console logs";
-                      default:
-                        return "Disconnected";
-                    }
-                  })()}
-                </span>
-              </div>
 
               {loggingSupported && connectionStatus === "connected" && (
                 <div className="space-y-2">
@@ -1506,6 +1485,40 @@ const Sidebar = ({
             </div>
           </TabsContent>
         </Tabs>
+        <div
+          role={
+            connectionStatus === "error" ||
+            connectionStatus === "error-connecting-to-proxy"
+              ? "alert"
+              : "status"
+          }
+          className="mt-3 flex items-start justify-center gap-2"
+        >
+          <span
+            aria-hidden="true"
+            className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+              connectionStatus === "connected"
+                ? "bg-green-500"
+                : connectionStatus === "connecting"
+                  ? "bg-yellow-500"
+                  : connectionStatus === "error" ||
+                      connectionStatus === "error-connecting-to-proxy"
+                    ? "bg-red-500"
+                    : "bg-gray-500"
+            }`}
+          />
+          <span className="text-sm text-muted-foreground break-words min-w-0">
+            {connectionStatus === "connected"
+              ? "Connected"
+              : connectionStatus === "connecting"
+                ? "Connecting..."
+                : connectionStatus === "error"
+                  ? `Connection failed: ${connectionError || "Check your server settings and try again."}`
+                  : connectionStatus === "error-connecting-to-proxy"
+                    ? `Could not connect to MCP Inspector Proxy: ${connectionError || "Check that the proxy is running and its address is correct."}`
+                    : "Disconnected"}
+          </span>
+        </div>
       </div>
       <div className="p-4 border-t">
         <div className="flex items-center justify-between">

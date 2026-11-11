@@ -72,6 +72,7 @@ interface UseConnectionOptions {
   oauthScope?: string;
   config: InspectorConfig;
   connectionType?: "direct" | "proxy";
+  onConnectionError?: (error: string | null) => void;
   onNotification?: (notification: Notification) => void;
   onStdErrNotification?: (notification: Notification) => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -95,6 +96,7 @@ export function useConnection({
   oauthScope,
   config,
   connectionType = "proxy",
+  onConnectionError = () => {},
   onNotification,
   onPendingRequest,
   onElicitationRequest,
@@ -307,6 +309,11 @@ export function useConnection({
         headers[proxyAuthTokenHeader] = `Bearer ${proxyAuthToken}`;
       }
       const proxyHealthResponse = await fetch(proxyHealthUrl, { headers });
+      if (!proxyHealthResponse.ok) {
+        throw new Error(
+          `Proxy health check returned HTTP ${proxyHealthResponse.status}`,
+        );
+      }
       const proxyHealth = await proxyHealthResponse.json();
       if (proxyHealth?.status !== "ok") {
         throw new Error("MCP Proxy Server is not healthy");
@@ -385,6 +392,7 @@ export function useConnection({
       trimmedServerUrlLength: sseUrl.trim().length,
     });
     console.trace("[useConnection] connect() call stack");
+    onConnectionError(null);
     setConnectionStatus("connecting");
 
     const trimmedSseUrl = sseUrl.trim();
@@ -400,6 +408,7 @@ export function useConnection({
         description: "Enter an MCP server URL before connecting.",
         variant: "destructive",
       });
+      onConnectionError("Enter an MCP server URL before connecting.");
       setConnectionStatus("error");
       return;
     }
@@ -425,8 +434,11 @@ export function useConnection({
         console.log("[useConnection] Checking proxy health...");
         await checkProxyHealth();
         console.log("[useConnection] Proxy health OK");
-      } catch {
+      } catch (error) {
         console.error("[useConnection] Proxy health check FAILED");
+        onConnectionError(
+          error instanceof Error ? error.message : String(error),
+        );
         setConnectionStatus("error-connecting-to-proxy");
         return;
       }
@@ -459,6 +471,9 @@ export function useConnection({
       );
 
       if (hasEmptyAuthHeader) {
+        onConnectionError(
+          "Authorization header is enabled but missing a token. Add a Bearer token or disable the header.",
+        );
         toast({
           title: "Invalid Authorization Header",
           description:
@@ -783,6 +798,9 @@ export function useConnection({
 
         // Check if it's a proxy auth error
         if (isProxyAuthError(error)) {
+          onConnectionError(
+            "Enter the proxy session token from the proxy server console in Configuration settings.",
+          );
           toast({
             title: "Proxy Authentication Required",
             description:
@@ -860,6 +878,7 @@ export function useConnection({
         });
       }
       console.error(e);
+      onConnectionError(e instanceof Error ? e.message : String(e));
       setConnectionStatus("error");
     }
   };
@@ -878,6 +897,7 @@ export function useConnection({
     authProvider.clear();
     setMcpClient(null);
     setClientTransport(null);
+    onConnectionError(null);
     setConnectionStatus("disconnected");
     setCompletionsSupported(false);
     setServerCapabilities(null);
